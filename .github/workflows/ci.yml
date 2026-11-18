@@ -200,8 +200,6 @@ jobs:
   audit:
     name: cargo audit
     runs-on: ${{ matrix.os }}
-    env:
-      SUPPLY_CHAIN_REPORT_DIR: ${{ runner.temp }}/supply-chain-reports
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
@@ -210,7 +208,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-audit
       - name: Prepare supply-chain report directory
-        run: mkdir -p "$SUPPLY_CHAIN_REPORT_DIR"
+        run: |
+          mkdir -p "$RUNNER_TEMP/supply-chain-reports"
+          echo "SUPPLY_CHAIN_REPORT_DIR=$RUNNER_TEMP/supply-chain-reports" >> "$GITHUB_ENV"
       - name: Run cargo audit
         id: audit
         shell: bash {0}
@@ -248,8 +248,6 @@ jobs:
   deny:
     name: cargo deny
     runs-on: ${{ matrix.os }}
-    env:
-      SUPPLY_CHAIN_REPORT_DIR: ${{ runner.temp }}/supply-chain-reports
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
@@ -257,7 +255,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@cargo-deny
       - name: Prepare supply-chain report directory
-        run: mkdir -p "$SUPPLY_CHAIN_REPORT_DIR"
+        run: |
+          mkdir -p "$RUNNER_TEMP/supply-chain-reports"
+          echo "SUPPLY_CHAIN_REPORT_DIR=$RUNNER_TEMP/supply-chain-reports" >> "$GITHUB_ENV"
       - name: Verify the license allowlist
         id: deny_licenses
         shell: bash {0}
