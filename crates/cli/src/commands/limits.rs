@@ -1,6 +1,8 @@
+use std::ffi::OsString;
 use std::panic;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::Args;
 use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
@@ -16,7 +18,7 @@ static CANCELLED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(unix)]
 mod signals {
-    use super::{CANCELLED, Ordering};
+    use super::{Ordering, CANCELLED};
     use std::os::raw::c_int;
     const SIGINT: c_int = 2;
     const SIGTERM: c_int = 15;
@@ -34,9 +36,12 @@ mod signals {
         pub fn install() -> Self {
             CANCELLED.store(false, Ordering::Relaxed);
             // SAFETY: The installed handler only writes an atomic flag.
-            let previous_int = unsafe { signal(SIGINT, cancel as usize) };
-            let previous_term = unsafe { signal(SIGTERM, cancel as usize) };
-            Self { previous_int, previous_term }
+            let previous_int = unsafe { signal(SIGINT, cancel as *const () as usize) };
+            let previous_term = unsafe { signal(SIGTERM, cancel as *const () as usize) };
+            Self {
+                previous_int,
+                previous_term,
+            }
         }
     }
     impl Drop for SignalGuard {
@@ -54,7 +59,9 @@ mod signals {
 mod signals {
     pub struct SignalGuard;
     impl SignalGuard {
-        pub fn install() -> Self { Self }
+        pub fn install() -> Self {
+            Self
+        }
     }
 }
 
@@ -174,8 +181,16 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
     }
     drop(env);
 
-    let self_exe = std::env::current_exe()
-        .map_err(|err| CliError(format!("failed to locate this binary: {err}")))?;
+    let self_exe = probe_executable()?;
+    // Probes run with a private working directory (see `ProbeScratch`), so
+    // the contract path they receive must not depend on this process's cwd.
+    let contract = std::fs::canonicalize(&args.contract).map_err(|err| {
+        CliError(format!(
+            "failed to resolve {}: {err}",
+            quote(args.contract.display())
+        ))
+    })?;
+    let scratch = ProbeScratch::create()?;
 
     // Runs one batch of probes concurrently, then logs them in ramp order.
     // Returns `None` when the run is cancelled before the batch starts.
@@ -183,8 +198,9 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
         if CANCELLED.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        let results =
-            probe_concurrently(values, |value| run_probe_process(&self_exe, &args, value));
+        let results = probe_concurrently(values, |value| {
+            run_probe_process(&self_exe, &scratch, &contract, &args, value)
+        });
         let mut outcomes = Vec::with_capacity(values.len());
         for (value, result) in values.iter().zip(results) {
             let ok = result?;
@@ -249,16 +265,135 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Locates the executable that probe subprocesses re-invoke.
+///
+/// `soroban-testkit` is often started through `PATH` or a symlink (for
+/// example `~/.cargo/bin` or a package manager's shim directory), so the
+/// probe must not assume `argv[0]` is a usable path. The OS-reported
+/// executable ([`std::env::current_exe`], which already resolves symlinks
+/// on Linux) is preferred; if it is unavailable or no longer exists (the
+/// binary was replaced while running), `argv[0]` is resolved instead:
+/// relative to the current directory when it contains a path separator,
+/// otherwise by searching `PATH`. The result is always absolute, so it
+/// stays valid for children started in a different working directory.
+fn probe_executable() -> Result<PathBuf, CliError> {
+    resolve_probe_executable(
+        std::env::current_exe().ok(),
+        std::env::args_os().next(),
+        std::env::var_os("PATH"),
+    )
+    .ok_or_else(|| {
+        CliError(
+            "failed to locate the soroban-testkit executable to start limits probes; \
+             run it by its full path"
+                .to_string(),
+        )
+    })
+}
+
+/// The pure part of [`probe_executable`], taking its inputs explicitly so
+/// every resolution branch is unit-testable.
+fn resolve_probe_executable(
+    current_exe: Option<PathBuf>,
+    argv0: Option<OsString>,
+    path_var: Option<OsString>,
+) -> Option<PathBuf> {
+    if let Some(exe) = current_exe.filter(|exe| exe.is_file()) {
+        return Some(std::fs::canonicalize(&exe).unwrap_or(exe));
+    }
+    let argv0 = PathBuf::from(argv0?);
+    if argv0.as_os_str().is_empty() {
+        return None;
+    }
+    if argv0.components().count() > 1 || argv0.is_absolute() {
+        // A path (absolute or relative to cwd): canonicalize resolves any
+        // symlink and makes it absolute.
+        return std::fs::canonicalize(&argv0)
+            .ok()
+            .filter(|exe| exe.is_file());
+    }
+    // A bare command name: it was found through PATH.
+    std::env::split_paths(&path_var?)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .flat_map(|dir| {
+            let plain = dir.join(&argv0);
+            let with_suffix = (!std::env::consts::EXE_SUFFIX.is_empty()).then(|| {
+                dir.join(format!(
+                    "{}{}",
+                    argv0.display(),
+                    std::env::consts::EXE_SUFFIX
+                ))
+            });
+            std::iter::once(plain).chain(with_suffix)
+        })
+        .find(|candidate| candidate.is_file())
+        .and_then(|exe| std::fs::canonicalize(exe).ok())
+}
+
+/// A private, per-run working directory for probe subprocesses.
+///
+/// Every probe child runs with this directory as its current directory and
+/// as its `TMPDIR`/`TMP`/`TEMP`, so anything the host or SDK might write
+/// relative to the working directory (such as a `test_snapshots/` tree) or
+/// to the system temp dir lands here rather than in the user's project.
+/// The directory is removed when the guard drops — on success, on error,
+/// and on an interrupted search — so a `limits` run leaves no temporary
+/// files or snapshot artifacts behind. Probes additionally disable snapshot
+/// capture (see [`load`]), so in practice the directory stays empty.
+struct ProbeScratch {
+    path: PathBuf,
+}
+
+impl ProbeScratch {
+    fn create() -> Result<Self, CliError> {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        // A few attempts covers a stale directory left by a killed run
+        // that happened to have the same pid.
+        let mut last_err = None;
+        for _ in 0..16 {
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = base.join(format!("soroban-testkit-limits-{pid}-{n}"));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(err) => last_err = Some(err),
+            }
+        }
+        Err(CliError(format!(
+            "failed to create a scratch directory for limits probes in {}: {}",
+            quote(base.display()),
+            last_err.map_or_else(|| "unknown error".to_string(), |err| err.to_string())
+        )))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ProbeScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Runs one probe in its own process. `Ok(true)` means the ramp value succeeded.
 fn run_probe_process(
-    self_exe: &std::path::Path,
+    self_exe: &Path,
+    scratch: &ProbeScratch,
+    contract: &Path,
     args: &LimitsArgs,
     value: u32,
 ) -> Result<bool, CliError> {
     let status = Command::new(self_exe)
+        .current_dir(scratch.path())
+        .env("TMPDIR", scratch.path())
+        .env("TMP", scratch.path())
+        .env("TEMP", scratch.path())
         .arg("__limits-probe")
         .arg("--contract")
-        .arg(&args.contract)
+        .arg(contract)
         .arg("--fn")
         .arg(&args.function)
         .arg("--ramp")
@@ -317,14 +452,14 @@ fn ladder_batch(start: u32, jobs: usize) -> Vec<u32> {
     batch
 }
 
+/// The last successful and first failing ladder values, if any.
+type LadderBounds = (Option<u32>, Option<u32>);
+
 /// Doubling phase. Probes ladder values in batches of `jobs`, reads each
 /// batch in order, and stops at the first failure. Returns the last success
 /// and the first failure. Both are `None` when the search reached the ceiling
 /// without failing.
-fn find_ladder_bounds<P>(
-    jobs: usize,
-    mut probe_batch: P,
-) -> Result<Search<(Option<u32>, Option<u32>)>, CliError>
+fn find_ladder_bounds<P>(jobs: usize, mut probe_batch: P) -> Result<Search<LadderBounds>, CliError>
 where
     P: FnMut(&[u32]) -> Result<Option<Vec<bool>>, CliError>,
 {
@@ -392,7 +527,8 @@ fn report_interrupted(args: &LimitsArgs, last_ok: Option<u32>) -> Result<(), Cli
             Ok(())
         }
         None => Err(CliError(format!(
-            "limits search interrupted before any successful probe for {:?}", args.function
+            "limits search interrupted before any successful probe for {:?}",
+            args.function
         ))),
     }
 }
@@ -744,6 +880,106 @@ mod tests {
 
     use super::*;
 
+    /// A uniquely named, self-removing temp dir for one unit test.
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "soroban-testkit-limits-unit-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fake_exe(dir: &Path, name: &str) -> PathBuf {
+        let exe = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&exe, b"").unwrap();
+        exe
+    }
+
+    #[test]
+    fn probe_executable_prefers_the_os_reported_executable() {
+        let dir = TestDir::new("prefers-current-exe");
+        let exe = fake_exe(&dir.0, "soroban-testkit");
+        let resolved =
+            resolve_probe_executable(Some(exe.clone()), Some("something-else".into()), None);
+        assert_eq!(resolved, Some(std::fs::canonicalize(exe).unwrap()));
+    }
+
+    #[test]
+    fn probe_executable_falls_back_to_a_path_search_for_a_bare_argv0() {
+        let dir = TestDir::new("path-search");
+        let bin = dir.0.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = fake_exe(&bin, "soroban-testkit");
+        let path_var =
+            std::env::join_paths([dir.0.join("missing"), PathBuf::new(), bin.clone()]).unwrap();
+        let resolved = resolve_probe_executable(
+            Some(dir.0.join("deleted-binary")),
+            Some("soroban-testkit".into()),
+            Some(path_var),
+        );
+        assert_eq!(resolved, Some(std::fs::canonicalize(exe).unwrap()));
+    }
+
+    #[test]
+    fn probe_executable_resolves_an_argv0_path_to_an_absolute_path() {
+        let dir = TestDir::new("argv0-path");
+        let exe = fake_exe(&dir.0, "soroban-testkit");
+        let resolved = resolve_probe_executable(None, Some(exe.clone().into()), None).unwrap();
+        assert!(resolved.is_absolute(), "{resolved:?}");
+        assert_eq!(resolved, std::fs::canonicalize(exe).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_executable_resolves_a_symlinked_argv0_to_its_target() {
+        let dir = TestDir::new("argv0-symlink");
+        let exe = fake_exe(&dir.0, "real-soroban-testkit");
+        let link = dir.0.join("soroban-testkit");
+        std::os::unix::fs::symlink(&exe, &link).unwrap();
+        let resolved = resolve_probe_executable(None, Some(link.into()), None);
+        assert_eq!(resolved, Some(std::fs::canonicalize(exe).unwrap()));
+    }
+
+    #[test]
+    fn probe_executable_is_none_when_nothing_resolves() {
+        let dir = TestDir::new("unresolvable");
+        assert_eq!(resolve_probe_executable(None, None, None), None);
+        assert_eq!(resolve_probe_executable(None, Some("".into()), None), None);
+        assert_eq!(
+            resolve_probe_executable(
+                Some(dir.0.join("gone")),
+                Some("soroban-testkit-not-on-path".into()),
+                Some(std::env::join_paths([dir.0.clone()]).unwrap()),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn probe_scratch_dirs_are_unique_and_removed_on_drop() {
+        let first = ProbeScratch::create().unwrap();
+        let second = ProbeScratch::create().unwrap();
+        assert_ne!(first.path(), second.path());
+        let path = first.path().to_path_buf();
+        assert!(path.is_dir());
+        std::fs::create_dir_all(path.join("test_snapshots")).unwrap();
+        std::fs::write(path.join("test_snapshots").join("probe.json"), b"{}").unwrap();
+        drop(first);
+        assert!(!path.exists(), "scratch dir must be removed: {path:?}");
+    }
+
     /// A probe where a value succeeds exactly when it is at most `threshold`.
     fn threshold_probe(
         threshold: u32,
@@ -876,7 +1112,10 @@ mod tests {
                 color: false,
             };
             let err = run(args, out).unwrap_err();
-            assert_eq!(err.0, format!("--jobs must be between 1 and 8 (got {jobs})"));
+            assert_eq!(
+                err.0,
+                format!("--jobs must be between 1 and 8 (got {jobs})")
+            );
         }
     }
 
