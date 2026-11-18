@@ -112,11 +112,17 @@ fn readme_links_resolve_to_current_paths() {
         } else {
             root.join(path)
         };
-        assert!(file.is_file(), "README link target does not exist: {target}");
+        assert!(
+            file.is_file(),
+            "README link target does not exist: {target}"
+        );
 
         if let Some(fragment) = fragment {
             let markdown = fs::read_to_string(&file).unwrap_or_else(|error| {
-                panic!("failed to read README link target {}: {error}", file.display())
+                panic!(
+                    "failed to read README link target {}: {error}",
+                    file.display()
+                )
             });
             assert!(
                 markdown_has_heading(&markdown, fragment),
@@ -438,8 +444,14 @@ fn network_free_test_and_cli_checks_are_documented_and_enforced_in_ci() {
         "cargo test --workspace --offline",
         "cargo run --offline -p soroban-testkit-cli -- --help",
     ] {
-        assert!(contributing.contains(command), "missing documented command `{command}`");
-        assert!(ci.contains(command), "missing network-free CI command `{command}`");
+        assert!(
+            contributing.contains(command),
+            "missing documented command `{command}`"
+        );
+        assert!(
+            ci.contains(command),
+            "missing network-free CI command `{command}`"
+        );
     }
     assert!(ci.contains("sudo unshare --net"));
 }
@@ -662,8 +674,14 @@ fn readme_lists_supported_rust_sdk_combinations_and_scheduled_checks() {
             "ci.yml must still have the {scheduled_job} job the README references"
         );
     }
-    assert!(ci.contains("schedule:"), "compatibility checks must remain scheduled");
-    assert!(ci.contains("cron: \"0 6 * * 1\""), "scheduled checks must run weekly");
+    assert!(
+        ci.contains("schedule:"),
+        "compatibility checks must remain scheduled"
+    );
+    assert!(
+        ci.contains("cron: \"0 6 * * 1\""),
+        "scheduled checks must run weekly"
+    );
 }
 
 // ---- #296: issue seeding guide ---------------------------------------------
