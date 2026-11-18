@@ -19,14 +19,6 @@ mod cli_docs_tests {
     fn get_help_output_with(subcommand: &str, flag: &str) -> String {
         let output = Command::new("cargo")
             .args(["run", "--bin", "soroban-testkit", "--", subcommand, flag])
-            .args([
-                "run",
-                "--bin",
-                "soroban-testkit",
-                "--",
-                subcommand,
-                "--help",
-            ])
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .output()
             .expect("Failed to run command");
@@ -182,7 +174,9 @@ mod cli_docs_tests {
 
     #[test]
     fn every_cli_flag_has_a_help_description() {
-        let help = get_help_output("audit");
+        // `-h` keeps each flag and its description on one line. `--help` splits them across lines once any
+        // argument has multi-line help, which made the per-line length check fail.
+        let help = get_short_help_output("audit");
 
         // Count flag definitions vs descriptions
         let strict_count = help.matches("--strict").count();
