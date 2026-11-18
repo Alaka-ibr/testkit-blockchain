@@ -199,10 +199,9 @@ jobs:
 
   audit:
     name: cargo audit
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     env:
       SUPPLY_CHAIN_REPORT_DIR: ${{ runner.temp }}/supply-chain-reports
-    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
@@ -248,10 +247,9 @@ jobs:
 
   deny:
     name: cargo deny
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     env:
       SUPPLY_CHAIN_REPORT_DIR: ${{ runner.temp }}/supply-chain-reports
-    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
@@ -342,6 +340,24 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            // Close any existing open issues for this scheduled check to avoid
+            // accumulating duplicate tracking issues across weekly runs.
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'upstream-sdk',
+            });
+            for (const issue of existing) {
+              if (issue.title.startsWith('Scheduled latest-SDK test failed')) {
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  state: 'closed',
+                });
+              }
+            }
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -366,6 +382,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: wasm32v1-none
+          # rust-src is required for building core/alloc when cross-compiling
+          # to wasm32v1-none with nightly (-Z build-std). rustfmt and clippy
+          # are included so the nightly run exercises the same surface as CI.
+          components: rust-src, rustfmt, clippy
       - name: Cache wasm target
         uses: actions/cache@v4
         with:
@@ -381,6 +401,24 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            // Close any existing open issues for this scheduled check to avoid
+            // accumulating duplicate tracking issues across weekly runs.
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'upstream-toolchain',
+            });
+            for (const issue of existing) {
+              if (issue.title.startsWith('Nightly toolchain compatibility check failed')) {
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  state: 'closed',
+                });
+              }
+            }
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
