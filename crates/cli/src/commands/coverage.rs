@@ -399,13 +399,6 @@ impl Invocation {
                         .unwrap_or(JSON_OUTPUT_PATH),
                 );
             }
-            Format::Html => push("--html"),
-            Format::Json => {
-                push("--json");
-                push("--summary-only");
-                push("--output-path");
-                push(JSON_OUTPUT_PATH);
-            }
         }
 
         if args.open {

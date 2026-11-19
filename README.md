@@ -154,6 +154,8 @@ Install from a local checkout:
 cargo install --path crates/cli --locked
 ```
 
+### Clean environment validation
+
 Install to a temporary directory for validation:
 
 ```sh
