@@ -48,6 +48,11 @@ Options:
           
           [default: 1]
 
+      --probe-timeout <SECONDS>
+          Stop an individual probe after N seconds (default 120; minimum 1)
+          
+          [default: 120]
+
       --dry-run
           Generate and print one probe's arguments without invoking the contract. This validates the contract spec and is useful when diagnosing defaults
 

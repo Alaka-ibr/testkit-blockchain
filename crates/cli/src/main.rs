@@ -14,7 +14,11 @@ fn main() {
         Commands::Coverage(args) => coverage::run(args, out),
         Commands::Limits(args) => limits::run(args, out),
         Commands::Audit(args) => audit::run(args, out),
-        Commands::LimitsProbe(args) => limits::run_probe(args),
+        Commands::LimitsProbe(args) => match limits::run_probe(args) {
+            Ok(true) => Ok(()),
+            Ok(false) => std::process::exit(limits::PROBE_REJECTED_EXIT_CODE),
+            Err(err) => Err(err),
+        },
     };
     if let Err(err) = result {
         eprintln!("{}", commands::render_error(out.error_prefix(), &err));
