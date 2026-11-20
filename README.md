@@ -230,7 +230,27 @@ See [Audit command limitations](#audit-command).
 Every ramp attempt runs in its own subprocess: a real `.wasm` contract
 that exceeds resource limits can abort the process outright rather than
 return an error, and isolating each attempt is the only safe way to probe
-past that boundary. Ledger read/write counts and transaction size aren't
+past that boundary. Use `--probe-timeout SECONDS` (default 120, minimum 1)
+to stop a hung probe and report its attempted ramp value; launch failures
+and timeouts abort the search without fabricating a contract limit.
+`--verbose` captures at most 8 KiB of each child's stderr for debugging;
+quiet/default output stays unchanged, and verbose diagnostics go to stderr.
+
+JSON results keep `schema_version: 1` and their existing fields. An additive
+`boundary` object has `kind` (`measured_failure` or `search_cap_reached`),
+`search_ceiling`, `first_failing`, and `failure_outcome`
+(`contract_rejected` or `host_aborted` when measured). If all probes
+succeed through 16,777,216, this is a cap, **not** a measured maximum.
+The text report also says explicitly when the search was capped.
+
+Example:
+
+```sh
+soroban-testkit limits --contract my_contract.wasm --fn transfer \
+  --ramp amount --probe-timeout 30 --verbose --json
+```
+
+Ledger read/write counts and transaction size aren't
 reported (they come from a network-side simulated footprint this crate
 doesn't produce); instructions and memory, measured locally, are. See
 [Limits command limitations](#limits-command).
