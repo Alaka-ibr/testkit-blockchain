@@ -919,7 +919,7 @@ fn validate_bool_defaults(
         let Some(input) = function
             .inputs
             .iter()
-            .find(|input| input.name.to_utf8_string_lossy() == *name)
+            .find(|input| input.name.to_utf8_string_lossy().as_str() == name.as_str())
         else {
             return Err(CliError(format!(
                 "bool default refers to unknown parameter {}",
@@ -1317,8 +1317,8 @@ mod tests {
                 ramp: "amount".into(),
                 jobs,
                 dry_run: false,
-            bool_defaults: Vec::new(),
-            auth_mode: AuthMode::All,
+                bool_defaults: Vec::new(),
+                auth_mode: AuthMode::All,
             };
             let out = crate::commands::output::Output {
                 verbosity: crate::commands::output::Verbosity::Quiet,
