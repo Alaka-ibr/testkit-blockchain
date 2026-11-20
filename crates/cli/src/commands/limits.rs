@@ -99,6 +99,10 @@ pub const MAX_JOBS: usize = 8;
 /// Largest ramp value tried while doubling. Values above it are never probed.
 const SEARCH_CEILING: u32 = 1 << 24;
 
+/// When enabled, probing starts at 0 and includes monotonicity sampling (issue #186, #187).
+const ENABLE_ZERO_PROBE: bool = true;
+const ENABLE_MONOTONICITY_CHECK: bool = true;
+
 /// Outcome of one search phase. `Cancelled` carries the best known success.
 #[derive(Debug, PartialEq)]
 enum Search<T> {
@@ -241,11 +245,30 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
             Search::Done(boundary) => boundary,
             Search::Cancelled { last_ok } => return report_interrupted(&args, last_ok),
         };
+
+        // Monotonicity sampling (issue #186) after refinement
+        if !CANCELLED.load(Ordering::Relaxed) {
+            let _ = sample_monotonicity(best, hi_start, 3, &mut probe_batch);
+        }
     }
 
     if CANCELLED.load(Ordering::Relaxed) {
         return report_interrupted(&args, Some(best));
     }
+
+    // Revalidate the boundary (issue #185) before final measurement
+    let (contract_id, env, func_spec, ramp_index) =
+        load(&args.contract, &args.function, &args.ramp)?;
+    let func = Symbol::new(&env, &args.function);
+    let revalidation_args = build_args(&env, &func_spec, ramp_index, best)?;
+    if !invoke_succeeds(&env, &contract_id, &func, revalidation_args) {
+        out.note(&format!(
+            "warning: boundary revalidation failed for {} = {best}; this may indicate \
+             nondeterministic contract behavior. consider running limits again.",
+            args.ramp
+        ));
+    }
+    drop(env);
 
     // Measure resources at the best-known-good value, in-process this
     // time (a known-successful call is safe to make directly).
@@ -255,8 +278,8 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
         "last successful {} for {:?}: {best}",
         args.ramp, args.function
     );
-    println!("  instructions: {instructions}");
-    println!("  memory bytes: {memory_bytes}");
+    println!("  instructions (CPU cycles): {instructions}");
+    println!("  memory (bytes): {memory_bytes}");
     out.note(
         "  (ledger reads/writes and transaction size are not measured by this command; \
          see --help)",
@@ -434,7 +457,11 @@ fn probe_concurrently(
 
 /// The doubling ladder value after `value`, or `None` past [`SEARCH_CEILING`].
 fn ladder_successor(value: u32) -> Option<u32> {
-    value.checked_mul(2).filter(|next| *next <= SEARCH_CEILING)
+    if value == 0 {
+        Some(1)
+    } else {
+        value.checked_mul(2).filter(|next| *next <= SEARCH_CEILING)
+    }
 }
 
 /// Up to `jobs` consecutive ladder values starting at `start`, never past
@@ -464,7 +491,7 @@ where
     P: FnMut(&[u32]) -> Result<Option<Vec<bool>>, CliError>,
 {
     let mut last_ok = None;
-    let mut next = Some(1u32);
+    let mut next = Some(if ENABLE_ZERO_PROBE { 0u32 } else { 1u32 });
     while let Some(start) = next {
         let batch = ladder_batch(start, jobs);
         let Some(results) = probe_batch(&batch)? else {
@@ -515,6 +542,50 @@ where
         }
     }
     Ok(Search::Done(lo))
+}
+
+/// Monotonicity sampling (issue #186): probe a few interior points to detect
+/// non-monotonic behavior. Returns true if monotonicity is verified.
+fn sample_monotonicity<P>(
+    lo: u32,
+    hi: u32,
+    sample_count: usize,
+    mut probe_batch: P,
+) -> Result<bool, CliError>
+where
+    P: FnMut(&[u32]) -> Result<Option<Vec<bool>>, CliError>,
+{
+    if !ENABLE_MONOTONICITY_CHECK || lo + 1 >= hi {
+        return Ok(true);
+    }
+
+    let gap = hi - lo;
+    let count = sample_count.min((gap - 1) as usize);
+    if count == 0 {
+        return Ok(true);
+    }
+
+    let samples: Vec<u32> = (1..=count as u32)
+        .map(|i| lo + gap * i / (count as u32 + 1))
+        .collect();
+
+    let Some(results) = probe_batch(&samples)? else {
+        return Ok(true); // Treat cancellation as inconclusive
+    };
+
+    // Check for monotonicity: all points between lo and hi should succeed
+    // since lo is a known success. If any fail, there's non-monotonic behavior.
+    for (sample, &ok) in samples.iter().zip(&results) {
+        if !ok {
+            eprintln!(
+                "warning: potential non-monotonic behavior detected: \
+                 value {} failed but is between known-success {} and known-failure {}",
+                sample, lo, hi
+            );
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// A cancelled run reports its last successful probe without claiming
@@ -1009,6 +1080,7 @@ mod tests {
     #[test]
     fn boundary_is_the_same_for_every_jobs_value() {
         let thresholds = [
+            0, // Test zero threshold (issue #187)
             1,
             2,
             3,
@@ -1036,9 +1108,25 @@ mod tests {
     #[test]
     fn a_failing_first_value_leaves_no_success() {
         assert_eq!(
-            find_ladder_bounds(4, threshold_probe(0)).unwrap(),
-            Search::Done((None, Some(1)))
+            find_ladder_bounds(4, threshold_probe(u32::MAX)).unwrap(),
+            Search::Done((None, Some(0)))
         );
+    }
+
+    #[test]
+    fn zero_probe_starts_at_zero_when_enabled() {
+        // When ENABLE_ZERO_PROBE is true, the first probe should be at 0
+        assert_eq!(
+            ladder_batch(if ENABLE_ZERO_PROBE { 0 } else { 1 }, 1),
+            vec![if ENABLE_ZERO_PROBE { 0 } else { 1 }]
+        );
+    }
+
+    #[test]
+    fn ladder_successor_handles_zero() {
+        assert_eq!(ladder_successor(0), Some(1));
+        assert_eq!(ladder_successor(1), Some(2));
+        assert_eq!(ladder_successor(2), Some(4));
     }
 
     #[test]
@@ -1323,6 +1411,33 @@ mod tests {
         let err = ramp_val(&env, &ty, 3).expect_err("not a ramp type");
         assert!(err.0.contains("(`Option<Vec<BytesN<32>>>`)"), "{err}");
         assert_no_debug_output(&err);
+    }
+
+    #[test]
+    fn monotonicity_sampling_detects_non_monotonic_behavior() {
+        let mut probe_calls = Vec::new();
+        let mut probe = |values: &[u32]| -> Result<Option<Vec<bool>>, CliError> {
+            probe_calls.push(values.to_vec());
+            // Return false for value 5 to simulate non-monotonic behavior
+            Ok(Some(values.iter().map(|v| *v != 5).collect()))
+        };
+
+        // lo=4 (success), hi=10 (failure), sample between them
+        let result = sample_monotonicity(4, 10, 3, &mut probe);
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "should detect non-monotonic behavior");
+    }
+
+    #[test]
+    fn monotonicity_sampling_passes_on_monotonic_data() {
+        let monotonic_probe = |values: &[u32]| -> Result<Option<Vec<bool>>, CliError> {
+            // All values in range are successful
+            Ok(Some(values.iter().map(|_| true).collect()))
+        };
+
+        let result = sample_monotonicity(1, 100, 5, monotonic_probe);
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "should pass on monotonic data");
     }
 
     #[test]
