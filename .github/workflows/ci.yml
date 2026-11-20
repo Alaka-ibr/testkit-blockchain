@@ -374,6 +374,11 @@ jobs:
     # just works fine.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    # The repository pins stable in rust-toolchain.toml. Force the nightly
+    # override for this job so rustup does not reinstall stable's wasm target
+    # into a directory restored from the nightly target cache.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     permissions:
       contents: read
       issues: write
@@ -389,7 +394,7 @@ jobs:
       - name: Cache wasm target
         uses: actions/cache@v4
         with:
-          path: ~/.rustup/toolchains/*/lib/rustlib/wasm32v1-none
+          path: ~/.rustup/toolchains/nightly-*/lib/rustlib/wasm32v1-none
           key: wasm32v1-none-nightly-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml') }}
           restore-keys: |
             wasm32v1-none-nightly-${{ runner.os }}-
