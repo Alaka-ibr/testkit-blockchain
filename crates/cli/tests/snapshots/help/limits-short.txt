@@ -15,6 +15,7 @@ Options:
   -v, --verbose          Print extra diagnostics (commands run, files scanned) to stderr
       --jobs <N>         Probe up to N ramp values at once (1 to 8, default 1) [default: 1]
       --dry-run          Generate and print one probe's arguments without invoking the contract. This validates the contract spec and is useful when diagnosing defaults
+      --json             Print the result as a JSON document (`schema_version` 1) on stdout
   -h, --help             Print help (see more with '--help')
 
 EXAMPLES:

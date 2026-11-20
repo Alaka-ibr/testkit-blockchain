@@ -91,6 +91,9 @@ pub struct LimitsArgs {
     /// This validates the contract spec and is useful when diagnosing defaults.
     #[arg(long)]
     dry_run: bool,
+    /// Print the result as a JSON document (`schema_version` 1) on stdout
+    #[arg(long)]
+    json: bool,
 }
 
 /// Largest accepted `--jobs`. Each concurrent probe is a full child process.
@@ -99,6 +102,12 @@ pub const MAX_JOBS: usize = 8;
 /// Largest ramp value tried while doubling. Values above it are never probed.
 const SEARCH_CEILING: u32 = 1 << 24;
 
+/// Version of the `limits --json` document shape. Bump it on any breaking change.
+const LIMITS_JSON_SCHEMA_VERSION: u32 = 1;
+
+/// The spec entry a contract uses for its constructor. It runs at deployment,
+/// so it is never a ramp target.
+const CONSTRUCTOR_NAME: &str = "__constructor";
 /// When enabled, probing starts at 0 and includes monotonicity sampling (issue #186, #187).
 const ENABLE_ZERO_PROBE: bool = true;
 const ENABLE_MONOTONICITY_CHECK: bool = true;
@@ -274,6 +283,11 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
     // time (a known-successful call is safe to make directly).
     let (instructions, memory_bytes) = measure(&args, best)?;
 
+    if args.json {
+        println!("{}", render_json(&args, best, instructions, memory_bytes));
+        return Ok(());
+    }
+
     println!(
         "last successful {} for {:?}: {best}",
         args.ramp, args.function
@@ -286,6 +300,20 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
     );
 
     Ok(())
+}
+
+/// Renders the result as the `limits --json` document.
+fn render_json(args: &LimitsArgs, best: u32, instructions: u64, memory_bytes: u64) -> String {
+    serde_json::json!({
+        "schema_version": LIMITS_JSON_SCHEMA_VERSION,
+        "contract": args.contract.display().to_string(),
+        "function": args.function,
+        "ramp": args.ramp,
+        "last_successful": best,
+        "instructions": instructions,
+        "memory_bytes": memory_bytes,
+    })
+    .to_string()
 }
 
 /// Locates the executable that probe subprocesses re-invoke.
@@ -677,6 +705,10 @@ fn load(
 
     let entries = soroban_spec::read::from_wasm(&wasm).map_err(|err| spec_error(contract, &err))?;
 
+    let constructor = entries.iter().find_map(|entry| match entry {
+        ScSpecEntry::FunctionV0(f) if f.name.to_string() == CONSTRUCTOR_NAME => Some(f.clone()),
+        _ => None,
+    });
     let func_spec = find_function_spec(entries, contract, function)?;
     let ramp_index = ramp_index_of(&func_spec, function, ramp)?;
 
@@ -690,7 +722,14 @@ fn load(
     // shared, longer-lived TestEnv would (see TestToken's mint, which
     // deliberately does NOT do this for that reason).
     env.mock_all_auths_allowing_non_root_auth();
-    let contract_id = env.register(wasm.as_slice(), ());
+    // A contract with a constructor must be registered with its arguments, or
+    // it never initialises. Ramp parameters do not apply to the constructor,
+    // so every one of its inputs gets its default.
+    let constructor_args = match &constructor {
+        Some(ctor) => build_args(&env, ctor, usize::MAX, 0)?,
+        None => SVec::new(&env),
+    };
+    let contract_id = env.register(wasm.as_slice(), constructor_args);
 
     Ok((contract_id, env, func_spec, ramp_index))
 }
@@ -778,6 +817,13 @@ fn find_function_spec(
     contract: &std::path::Path,
     function: &str,
 ) -> Result<ScSpecFunctionV0, CliError> {
+    if function.starts_with("__") {
+        return Err(CliError(format!(
+            "{} is a reserved contract name, not a function that can be ramped; \
+             the constructor runs at deployment and is handled automatically",
+            quote(function)
+        )));
+    }
     entries
         .into_iter()
         .find_map(|entry| match entry {
@@ -929,10 +975,12 @@ fn default_val(
         ScSpecTypeDef::String => Ok(soroban_sdk::String::from_str(env, "").into_val(env)),
         ScSpecTypeDef::Bytes => Ok(soroban_sdk::Bytes::new(env).into_val(env)),
         ScSpecTypeDef::Vec(_) => Ok(SVec::<Val>::new(env).into_val(env)),
+        // None: an omitted optional argument is the default a caller would send.
+        ScSpecTypeDef::Option(_) => Ok(Option::<u32>::None.into_val(env)),
         other => Err(CliError(format!(
             "parameter {} has type {}, which this command doesn't know how to \
              default yet; every parameter other than --ramp needs one of Address, bool, \
-             u32/i32/u64/i64/u128/i128, Symbol, String, Bytes or Vec",
+             u32/i32/u64/i64/u128/i128, Symbol, String, Bytes, Vec or Option",
             quote(input.name.to_utf8_string_lossy()),
             quote(type_name(other))
         ))),
@@ -1273,6 +1321,9 @@ mod tests {
             ScSpecTypeDef::String,
             ScSpecTypeDef::Bytes,
             vec_of(ScSpecTypeDef::U32),
+            ScSpecTypeDef::Option(Box::new(soroban_sdk::xdr::ScSpecTypeOption {
+                value_type: Box::new(ScSpecTypeDef::U32),
+            })),
         ]
     }
 
