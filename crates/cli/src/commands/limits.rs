@@ -1,10 +1,11 @@
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
 use soroban_sdk::token::StellarAssetClient;
 use soroban_sdk::xdr::{ScSpecEntry, ScSpecFunctionInputV0, ScSpecFunctionV0, ScSpecTypeDef};
@@ -91,6 +92,34 @@ pub struct LimitsArgs {
     /// This validates the contract spec and is useful when diagnosing defaults.
     #[arg(long)]
     dry_run: bool,
+    /// Override a non-ramp bool parameter's default (repeatable): --bool-default enabled=true.
+    #[arg(long = "bool-default", value_name = "PARAM=BOOL", action = clap::ArgAction::Append)]
+    bool_defaults: Vec<String>,
+    /// Authorization mock scope: all (default), root-only, or none.
+    #[arg(long = "auth-mode", value_enum, default_value = "all")]
+    auth_mode: AuthMode,
+}
+
+/// Authorization behavior for each isolated limits probe.
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum AuthMode {
+    /// Approve every authorization entry, including nested invocations.
+    #[default]
+    All,
+    /// Approve only authorization required by the root invocation.
+    RootOnly,
+    /// Do not install authorization mocks.
+    None,
+}
+
+impl AuthMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::RootOnly => "root-only",
+            Self::None => "none",
+        }
+    }
 }
 
 /// Largest accepted `--jobs`. Each concurrent probe is a full child process.
@@ -123,6 +152,10 @@ pub struct ProbeArgs {
     ramp: String,
     #[arg(long)]
     value: u32,
+    #[arg(long = "bool-default", value_name = "PARAM=BOOL", action = clap::ArgAction::Append)]
+    bool_defaults: Vec<String>,
+    #[arg(long = "auth-mode", value_enum, default_value = "all")]
+    auth_mode: AuthMode,
 }
 
 /// Empirically discovers a resource ceiling by invoking `--fn` with an
@@ -177,8 +210,11 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
     // abort risk documented above, and it means a typo'd --fn or --ramp
     // reports its actual cause instead of the generic "failed at value 1"
     // a swallowed child-process error would otherwise produce.
-    let (_, env, function, ramp_index) = load(&args.contract, &args.function, &args.ramp)?;
-    let preview = build_args(&env, &function, ramp_index, 1)?;
+    let bool_defaults = parse_bool_defaults(&args.bool_defaults)?;
+    let (_, env, function, ramp_index) =
+        load(&args.contract, &args.function, &args.ramp, args.auth_mode)?;
+    validate_bool_defaults(&function, &bool_defaults)?;
+    let preview = build_args(&env, &function, ramp_index, &bool_defaults, 1)?;
     if args.dry_run {
         println!("probe {}=1 generated arguments: {preview:?}", args.ramp);
         return Ok(());
@@ -258,9 +294,9 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
 
     // Revalidate the boundary (issue #185) before final measurement
     let (contract_id, env, func_spec, ramp_index) =
-        load(&args.contract, &args.function, &args.ramp)?;
+        load(&args.contract, &args.function, &args.ramp, args.auth_mode)?;
     let func = Symbol::new(&env, &args.function);
-    let revalidation_args = build_args(&env, &func_spec, ramp_index, best)?;
+    let revalidation_args = build_args(&env, &func_spec, ramp_index, &bool_defaults, best)?;
     if !invoke_succeeds(&env, &contract_id, &func, revalidation_args) {
         out.note(&format!(
             "warning: boundary revalidation failed for {} = {best}; this may indicate \
@@ -272,7 +308,7 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
 
     // Measure resources at the best-known-good value, in-process this
     // time (a known-successful call is safe to make directly).
-    let (instructions, memory_bytes) = measure(&args, best)?;
+    let (instructions, memory_bytes) = measure(&args, best, &bool_defaults)?;
 
     println!(
         "last successful {} for {:?}: {best}",
@@ -409,7 +445,8 @@ fn run_probe_process(
     args: &LimitsArgs,
     value: u32,
 ) -> Result<bool, CliError> {
-    let status = Command::new(self_exe)
+    let mut command = Command::new(self_exe);
+    command
         .current_dir(scratch.path())
         .env("TMPDIR", scratch.path())
         .env("TMP", scratch.path())
@@ -423,6 +460,12 @@ fn run_probe_process(
         .arg(&args.ramp)
         .arg("--value")
         .arg(value.to_string())
+        .arg("--auth-mode")
+        .arg(args.auth_mode.as_str());
+    for default in &args.bool_defaults {
+        command.arg("--bool-default").arg(default);
+    }
+    let status = command
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -609,9 +652,11 @@ fn report_interrupted(args: &LimitsArgs, last_ok: Option<u32>) -> Result<(), Cli
 /// output. Run in its own process by [`run`].
 pub fn run_probe(args: ProbeArgs) -> Result<(), CliError> {
     let _quiet = QuietPanics::install();
+    let bool_defaults = parse_bool_defaults(&args.bool_defaults)?;
     let (contract_id, env, function, ramp_index) =
-        load(&args.contract, &args.function, &args.ramp)?;
-    let args_vec = build_args(&env, &function, ramp_index, args.value)?;
+        load(&args.contract, &args.function, &args.ramp, args.auth_mode)?;
+    validate_bool_defaults(&function, &bool_defaults)?;
+    let args_vec = build_args(&env, &function, ramp_index, &bool_defaults, args.value)?;
     let func = Symbol::new(&env, &args.function);
     if invoke_succeeds(&env, &contract_id, &func, args_vec) {
         Ok(())
@@ -620,13 +665,17 @@ pub fn run_probe(args: ProbeArgs) -> Result<(), CliError> {
     }
 }
 
-fn measure(args: &LimitsArgs, value: u32) -> Result<(u64, u64), CliError> {
+fn measure(
+    args: &LimitsArgs,
+    value: u32,
+    bool_defaults: &BTreeMap<String, bool>,
+) -> Result<(u64, u64), CliError> {
     let (contract_id, env, function, ramp_index) =
-        load(&args.contract, &args.function, &args.ramp)?;
+        load(&args.contract, &args.function, &args.ramp, args.auth_mode)?;
     let func = Symbol::new(&env, &args.function);
     let mut budget = env.cost_estimate().budget();
     budget.reset_default();
-    let args_vec = build_args(&env, &function, ramp_index, value)?;
+    let args_vec = build_args(&env, &function, ramp_index, bool_defaults, value)?;
     if !invoke_succeeds(&env, &contract_id, &func, args_vec) {
         return Err(CliError(
             "internal error: the ramp value chosen as successful failed on re-measurement"
@@ -667,6 +716,7 @@ fn load(
     contract: &std::path::Path,
     function: &str,
     ramp: &str,
+    auth_mode: AuthMode,
 ) -> Result<(Address, Env, ScSpecFunctionV0, usize), CliError> {
     let wasm = std::fs::read(contract).map_err(|err| {
         CliError(format!(
@@ -683,13 +733,14 @@ fn load(
     let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
         capture_snapshot_at_drop: false,
     });
-    // Auth is not what this command measures — it exists to find a
-    // resource ceiling, not to prove who may call the function — and each
-    // probe runs in its own throwaway process/Env, so blanket-approving
-    // auth here carries none of the AuthMatrix-correctness risk that a
-    // shared, longer-lived TestEnv would (see TestToken's mint, which
-    // deliberately does NOT do this for that reason).
-    env.mock_all_auths_allowing_non_root_auth();
+    // Keep the historical permissive mode for compatibility, but allow
+    // callers to constrain mocks to root authorization or disable them.
+    // Each probe owns a fresh Env, so these policies cannot leak between runs.
+    match auth_mode {
+        AuthMode::All => env.mock_all_auths_allowing_non_root_auth(),
+        AuthMode::RootOnly => env.mock_all_auths(),
+        AuthMode::None => {}
+    }
     let contract_id = env.register(wasm.as_slice(), ());
 
     Ok((contract_id, env, func_spec, ramp_index))
@@ -822,10 +873,75 @@ fn ramp_index_of(
         })
 }
 
+
+/// Parses repeatable `--bool-default PARAM=BOOL` values.
+fn parse_bool_defaults(values: &[String]) -> Result<BTreeMap<String, bool>, CliError> {
+    let mut defaults = BTreeMap::new();
+    for value in values {
+        let (name, raw) = value.split_once('=').ok_or_else(|| {
+            CliError(format!(
+                "invalid bool default {}; expected PARAM=true or PARAM=false",
+                quote(value)
+            ))
+        })?;
+        if name.is_empty() {
+            return Err(CliError(format!(
+                "invalid bool default {}; parameter name cannot be empty",
+                quote(value)
+            )));
+        }
+        let parsed = match raw {
+            "true" => true,
+            "false" => false,
+            _ => {
+                return Err(CliError(format!(
+                    "invalid bool default {}; value must be true or false",
+                    quote(raw)
+                )))
+            }
+        };
+        if defaults.insert(name.to_string(), parsed).is_some() {
+            return Err(CliError(format!(
+                "bool default for {} was provided more than once",
+                quote(name)
+            )));
+        }
+    }
+    Ok(defaults)
+}
+
+/// Reject overrides that do not refer to bool inputs in the selected function.
+fn validate_bool_defaults(
+    function: &ScSpecFunctionV0,
+    defaults: &BTreeMap<String, bool>,
+) -> Result<(), CliError> {
+    for name in defaults.keys() {
+        let Some(input) = function
+            .inputs
+            .iter()
+            .find(|input| input.name.to_utf8_string_lossy() == *name)
+        else {
+            return Err(CliError(format!(
+                "bool default refers to unknown parameter {}",
+                quote(name)
+            )));
+        };
+        if !matches!(input.type_, ScSpecTypeDef::Bool) {
+            return Err(CliError(format!(
+                "bool default for {} cannot be applied to parameter type {}",
+                quote(name),
+                quote(type_name(&input.type_))
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn build_args(
     env: &Env,
     function: &ScSpecFunctionV0,
     ramp_index: usize,
+    bool_defaults: &BTreeMap<String, bool>,
     ramp_value: u32,
 ) -> Result<SVec<Val>, CliError> {
     let admin = Address::generate(env);
@@ -834,7 +950,13 @@ fn build_args(
         let val = if i == ramp_index {
             ramp_val(env, &input.type_, ramp_value)?
         } else {
-            default_val(env, &admin, &input.type_, input)?
+            default_val(
+                env,
+                &admin,
+                &input.type_,
+                input,
+                bool_defaults.get(&input.name.to_utf8_string_lossy()).copied(),
+            )?
         };
         vals.push_back(val);
     }
@@ -880,6 +1002,7 @@ fn default_val(
     admin: &Address,
     type_: &ScSpecTypeDef,
     input: &ScSpecFunctionInputV0,
+    bool_default: Option<bool>,
 ) -> Result<Val, CliError> {
     match type_ {
         // A parameter literally named `token` is, by overwhelming Soroban
@@ -911,7 +1034,7 @@ fn default_val(
             Ok(token_address.into_val(env))
         }
         ScSpecTypeDef::Address => Ok(admin.into_val(env)),
-        ScSpecTypeDef::Bool => Ok(false.into_val(env)),
+        ScSpecTypeDef::Bool => Ok(bool_default.unwrap_or(false).into_val(env)),
         // 1, not 0: verified against sororail-contracts' batch_payout,
         // whose execute_equal(..., amount_each: i128) requires a positive
         // amount and rejects 0 with its own InvalidAmount error before
@@ -1108,7 +1231,7 @@ mod tests {
     #[test]
     fn a_failing_first_value_leaves_no_success() {
         assert_eq!(
-            find_ladder_bounds(4, threshold_probe(u32::MAX)).unwrap(),
+            find_ladder_bounds(4, |values: &[u32]| Ok(Some(vec![false; values.len()]))).unwrap(),
             Search::Done((None, Some(0)))
         );
     }
@@ -1160,7 +1283,7 @@ mod tests {
         };
         assert_eq!(
             find_ladder_bounds(2, &mut probe).unwrap(),
-            Search::Cancelled { last_ok: Some(2) }
+            Search::Cancelled { last_ok: Some(1) }
         );
     }
 
@@ -1194,6 +1317,8 @@ mod tests {
                 ramp: "amount".into(),
                 jobs,
                 dry_run: false,
+            bool_defaults: Vec::new(),
+            auth_mode: AuthMode::All,
             };
             let out = crate::commands::output::Output {
                 verbosity: crate::commands::output::Verbosity::Quiet,
@@ -1215,6 +1340,8 @@ mod tests {
             ramp: "amount".into(),
             jobs: 1,
             dry_run: false,
+            bool_defaults: Vec::new(),
+            auth_mode: AuthMode::All,
         };
         let err = report_interrupted(&args, None).expect_err("no successful result");
         assert!(err.0.contains("before any successful probe"));
@@ -1354,6 +1481,70 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn bool_defaults_parse_true_and_false_and_reject_invalid_values() {
+        let parsed = parse_bool_defaults(&[
+            "enabled=true".to_string(),
+            "paused=false".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.get("enabled"), Some(&true));
+        assert_eq!(parsed.get("paused"), Some(&false));
+
+        for invalid in [
+            vec!["enabled".to_string()],
+            vec!["=true".to_string()],
+            vec!["enabled=yes".to_string()],
+            vec!["enabled=true".to_string(), "enabled=false".to_string()],
+        ] {
+            assert!(parse_bool_defaults(&invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn bool_default_overrides_are_converted_to_soroban_values() {
+        use soroban_sdk::TryFromVal;
+
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let fixture = input("enabled", ScSpecTypeDef::Bool);
+        let enabled = default_val(&env, &admin, &fixture.type_, &fixture, Some(true)).unwrap();
+        let disabled = default_val(&env, &admin, &fixture.type_, &fixture, Some(false)).unwrap();
+        assert!(bool::try_from_val(&env, &enabled).unwrap());
+        assert!(!bool::try_from_val(&env, &disabled).unwrap());
+    }
+
+    #[test]
+    fn bool_defaults_must_match_a_bool_parameter() {
+        let func = function(
+            "run",
+            vec![
+                input("enabled", ScSpecTypeDef::Bool),
+                input("amount", ScSpecTypeDef::U32),
+            ],
+        );
+        assert!(validate_bool_defaults(
+            &func,
+            &BTreeMap::from([("enabled".to_string(), true)])
+        )
+        .is_ok());
+        assert!(validate_bool_defaults(
+            &func,
+            &BTreeMap::from([("missing".to_string(), true)])
+        )
+        .unwrap_err()
+        .0
+        .contains("unknown parameter"));
+        assert!(validate_bool_defaults(
+            &func,
+            &BTreeMap::from([("amount".to_string(), true)])
+        )
+        .unwrap_err()
+        .0
+        .contains("cannot be applied"));
+    }
+
     #[test]
     fn every_supported_default_type_builds_a_value() {
         let env = Env::default();
@@ -1361,7 +1552,7 @@ mod tests {
         for ty in default_types() {
             let fixture = input("param", ty.clone());
             assert!(
-                default_val(&env, &admin, &ty, &fixture).is_ok(),
+                default_val(&env, &admin, &ty, &fixture, None).is_ok(),
                 "default type {ty:?} should be supported"
             );
         }
@@ -1372,7 +1563,7 @@ mod tests {
         let env = Env::default();
         let admin = soroban_sdk::Address::generate(&env);
         let fixture = input("token", ScSpecTypeDef::Address);
-        assert!(default_val(&env, &admin, &ScSpecTypeDef::Address, &fixture).is_ok());
+        assert!(default_val(&env, &admin, &ScSpecTypeDef::Address, &fixture, None).is_ok());
     }
 
     #[test]
@@ -1384,7 +1575,7 @@ mod tests {
             value_type: Box::new(ScSpecTypeDef::U32),
         }));
         let fixture = input("balances", ty.clone());
-        let err = default_val(&env, &admin, &ty, &fixture).expect_err("Map has no default");
+        let err = default_val(&env, &admin, &ty, &fixture, None).expect_err("Map has no default");
         assert!(err.0.contains("doesn't know how to default"), "{err}");
         assert!(
             err.0
