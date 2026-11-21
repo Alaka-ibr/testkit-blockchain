@@ -13,7 +13,7 @@ Limitations:
   - Other parameters get fixed defaults: a generated Address (one
     named `token` gets a funded Stellar Asset Contract), `false`, 1
     for integers, Symbol `x`, and an empty String, Bytes or Vec. Map,
-    Tuple, Option, Result and user-defined types are rejected.
+    Tuple, Result and user-defined types are rejected.
   - All authorization is mocked as approved.
   - Ledger reads/writes and transaction size are not measured; they
     need network-backed transaction simulation.
@@ -48,8 +48,16 @@ Options:
           
           [default: 1]
 
+      --probe-timeout <SECONDS>
+          Stop an individual probe after N seconds (default 120; minimum 1)
+          
+          [default: 120]
+
       --dry-run
           Generate and print one probe's arguments without invoking the contract. This validates the contract spec and is useful when diagnosing defaults
+
+      --json
+          Print the result as a JSON document (`schema_version` 1) on stdout
 
   -h, --help
           Print help (see a summary with '-h')

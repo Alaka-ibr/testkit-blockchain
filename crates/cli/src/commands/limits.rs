@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::io::Read;
 use std::panic;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use clap::{Args, ValueEnum};
 use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
@@ -88,6 +90,9 @@ pub struct LimitsArgs {
     /// Probe up to N ramp values at once (1 to 8, default 1).
     #[arg(long, value_name = "N", default_value_t = 1)]
     jobs: usize,
+    /// Stop an individual probe after N seconds (default 120; minimum 1).
+    #[arg(long, value_name = "SECONDS", default_value_t = 120)]
+    probe_timeout: u64,
     /// Generate and print one probe's arguments without invoking the contract.
     /// This validates the contract spec and is useful when diagnosing defaults.
     #[arg(long)]
@@ -98,6 +103,9 @@ pub struct LimitsArgs {
     /// Authorization mock scope: all (default), root-only, or none.
     #[arg(long = "auth-mode", value_enum, default_value = "all")]
     auth_mode: AuthMode,
+    /// Print the result as a JSON document (`schema_version` 1) on stdout.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Authorization behavior for each isolated limits probe.
@@ -121,13 +129,22 @@ impl AuthMode {
         }
     }
 }
+}
 
 /// Largest accepted `--jobs`. Each concurrent probe is a full child process.
 pub const MAX_JOBS: usize = 8;
 
 /// Largest ramp value tried while doubling. Values above it are never probed.
 const SEARCH_CEILING: u32 = 1 << 24;
+const MAX_PROBE_STDERR_BYTES: usize = 8 * 1024;
+pub const PROBE_REJECTED_EXIT_CODE: i32 = 10;
 
+/// Version of the `limits --json` document shape. Bump it on any breaking change.
+const LIMITS_JSON_SCHEMA_VERSION: u32 = 1;
+
+/// The spec entry a contract uses for its constructor. It runs at deployment,
+/// so it is never a ramp target.
+const CONSTRUCTOR_NAME: &str = "__constructor";
 /// When enabled, probing starts at 0 and includes monotonicity sampling (issue #186, #187).
 const ENABLE_ZERO_PROBE: bool = true;
 const ENABLE_MONOTONICITY_CHECK: bool = true;
@@ -137,6 +154,55 @@ const ENABLE_MONOTONICITY_CHECK: bool = true;
 enum Search<T> {
     Done(T),
     Cancelled { last_ok: Option<u32> },
+}
+
+/// Protocol for isolated child probes: a normal rejection is not a host abort.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProbeExit {
+    Success,
+    ContractRejected,
+    HostAborted,
+    TimedOut,
+    LaunchFailed(String),
+    Cancelled,
+}
+
+impl ProbeExit {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Success => "ok",
+            Self::ContractRejected => "contract_rejected",
+            Self::HostAborted => "host_aborted",
+            Self::TimedOut => "timed_out",
+            Self::LaunchFailed(_) => "launch_failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProbeResult {
+    outcome: ProbeExit,
+    diagnostic: Option<String>,
+}
+
+fn classify_probe_exit(status: ExitStatus) -> ProbeExit {
+    match status.code() {
+        Some(0) => ProbeExit::Success,
+        Some(PROBE_REJECTED_EXIT_CODE) => ProbeExit::ContractRejected,
+        Some(1) => {
+            ProbeExit::LaunchFailed("probe setup failed; inspect --verbose diagnostics".into())
+        }
+        _ => ProbeExit::HostAborted,
+    }
+}
+
+fn boundary_kind(first_failing: Option<u32>) -> &'static str {
+    if first_failing.is_some() {
+        "measured_failure"
+    } else {
+        "search_cap_reached"
+    }
 }
 
 /// Hidden: runs exactly one probe (a single ramp value) and reports its
@@ -202,6 +268,11 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
             args.jobs
         )));
     }
+    if args.probe_timeout == 0 {
+        return Err(CliError(
+            "--probe-timeout must be at least 1 second".to_string(),
+        ));
+    }
     let _signal_guard = signals::SignalGuard::install();
     // Validate the configuration (function exists, ramp parameter exists,
     // every parameter's type is one this command knows how to default or
@@ -231,6 +302,7 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
         ))
     })?;
     let scratch = ProbeScratch::create()?;
+    let mut failure_kinds: BTreeMap<u32, ProbeExit> = BTreeMap::new();
 
     // Runs one batch of probes concurrently, then logs them in ramp order.
     // Returns `None` when the run is cancelled before the batch starts.
@@ -239,16 +311,52 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
             return Ok(None);
         }
         let results = probe_concurrently(values, |value| {
-            run_probe_process(&self_exe, &scratch, &contract, &args, value)
+            run_probe_process(
+                &self_exe,
+                &scratch,
+                &contract,
+                &args,
+                value,
+                Duration::from_secs(args.probe_timeout),
+                out.verbosity == super::output::Verbosity::Verbose,
+            )
         });
+        if CANCELLED.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         let mut outcomes = Vec::with_capacity(values.len());
         for (value, result) in values.iter().zip(results) {
-            let ok = result?;
+            let result = result?;
             out.detail(format!(
                 "probe {}={value}: {}",
                 args.ramp,
-                if ok { "ok" } else { "failed" }
+                result.outcome.label()
             ));
+            if let Some(diagnostic) = &result.diagnostic {
+                for line in diagnostic.lines() {
+                    out.detail(format!("  child stderr: {line}"));
+                }
+            }
+            let ok = match result.outcome {
+                ProbeExit::Success => true,
+                ProbeExit::ContractRejected | ProbeExit::HostAborted => {
+                    failure_kinds.insert(*value, result.outcome);
+                    false
+                }
+                ProbeExit::TimedOut => {
+                    return Err(CliError(format!(
+                        "probe {}={value} timed out after {} seconds; inspect the contract or increase --probe-timeout",
+                        quote(&args.ramp), args.probe_timeout
+                    )));
+                }
+                ProbeExit::LaunchFailed(reason) => {
+                    return Err(CliError(format!(
+                        "failed to launch probe {}={value}: {reason}; check the executable and use --verbose",
+                        quote(&args.ramp)
+                    )));
+                }
+                ProbeExit::Cancelled => return Ok(None),
+            };
             outcomes.push(ok);
         }
         Ok(Some(outcomes))
@@ -266,9 +374,10 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
 
     let Some(last_ok) = ladder_ok else {
         return Err(CliError(format!(
-            "{} failed even at the smallest ramp value (1) for parameter {}; check that \
+            "{} failed even at the smallest ramp value ({}) for parameter {}; check that \
              the function succeeds with default arguments (run with --verbose to see each probe)",
             quote(&args.function),
+            if ENABLE_ZERO_PROBE { 0 } else { 1 },
             quote(&args.ramp)
         )));
     };
@@ -284,13 +393,18 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
 
         // Monotonicity sampling (issue #186) after refinement
         if !CANCELLED.load(Ordering::Relaxed) {
-            let _ = sample_monotonicity(best, hi_start, 3, &mut probe_batch);
+            sample_monotonicity(best, hi_start, 3, &mut probe_batch)?;
         }
     }
 
     if CANCELLED.load(Ordering::Relaxed) {
         return report_interrupted(&args, Some(best));
     }
+
+    // A cap without an observed failure is not a proven maximum.
+    let first_failing = ladder_failed.map(|_| best + 1);
+    let failure_kind =
+        first_failing.and_then(|value| failure_kinds.get(&value).map(ProbeExit::label));
 
     // Revalidate the boundary (issue #185) before final measurement
     let (contract_id, env, func_spec, ramp_index) =
@@ -310,18 +424,63 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
     // time (a known-successful call is safe to make directly).
     let (instructions, memory_bytes) = measure(&args, best, &bool_defaults)?;
 
+    if args.json {
+        println!(
+            "{}",
+            render_json(&args, best, instructions, memory_bytes, first_failing, failure_kind)
+        );
+        return Ok(());
+    }
+
     println!(
         "last successful {} for {:?}: {best}",
         args.ramp, args.function
     );
     println!("  instructions (CPU cycles): {instructions}");
     println!("  memory (bytes): {memory_bytes}");
+    match first_failing {
+        Some(value) => println!(
+            "  first failing {}: {value} ({})",
+            args.ramp,
+            failure_kind.unwrap_or("unknown")
+        ),
+        None => println!(
+            "  search capped at {SEARCH_CEILING}; no failing probe observed (not a measured maximum)"
+        ),
+    }
     out.note(
         "  (ledger reads/writes and transaction size are not measured by this command; \
          see --help)",
     );
 
     Ok(())
+}
+
+/// Renders the result as the `limits --json` document.
+fn render_json(
+    args: &LimitsArgs,
+    best: u32,
+    instructions: u64,
+    memory_bytes: u64,
+    first_failing: Option<u32>,
+    failure_kind: Option<&str>,
+) -> String {
+    serde_json::json!({
+        "schema_version": LIMITS_JSON_SCHEMA_VERSION,
+        "contract": args.contract.display().to_string(),
+        "function": args.function,
+        "ramp": args.ramp,
+        "last_successful": best,
+        "instructions": instructions,
+        "memory_bytes": memory_bytes,
+        "boundary": {
+            "kind": boundary_kind(first_failing),
+            "search_ceiling": SEARCH_CEILING,
+            "first_failing": first_failing,
+            "failure_outcome": failure_kind,
+        },
+    })
+    .to_string()
 }
 
 /// Locates the executable that probe subprocesses re-invoke.
@@ -437,14 +596,17 @@ impl Drop for ProbeScratch {
     }
 }
 
-/// Runs one probe in its own process. `Ok(true)` means the ramp value succeeded.
+/// Run one isolated probe. Quiet runs discard diagnostics as before.
+/// Verbose runs drain stderr concurrently and retain no more than 8 KiB.
 fn run_probe_process(
     self_exe: &Path,
     scratch: &ProbeScratch,
     contract: &Path,
     args: &LimitsArgs,
     value: u32,
-) -> Result<bool, CliError> {
+    timeout: Duration,
+    verbose: bool,
+) -> ProbeResult {
     let mut command = Command::new(self_exe);
     command
         .current_dir(scratch.path())
@@ -465,20 +627,80 @@ fn run_probe_process(
     for default in &args.bool_defaults {
         command.arg("--bool-default").arg(default);
     }
-    let status = command
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|err| CliError(format!("failed to spawn probe: {err}")))?;
-    Ok(status.success())
+    command
+        .stdout(Stdio::null())
+        .stderr(if verbose {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return ProbeResult {
+                outcome: ProbeExit::LaunchFailed(error.to_string()),
+                diagnostic: None,
+            };
+        }
+    };
+    let reader = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut truncated = false;
+            loop {
+                match stderr.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        let capacity = MAX_PROBE_STDERR_BYTES.saturating_sub(kept.len());
+                        let take = count.min(capacity);
+                        kept.extend_from_slice(&chunk[..take]);
+                        truncated |= take != count;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            let mut message = String::from_utf8_lossy(&kept).into_owned();
+            if truncated {
+                message.push_str("\n[child stderr truncated at 8192 bytes]");
+            }
+            message
+        })
+    });
+    let start = Instant::now();
+    let outcome = loop {
+        if CANCELLED.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            break ProbeExit::Cancelled;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break classify_probe_exit(status),
+            Ok(None) if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break ProbeExit::TimedOut;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break ProbeExit::LaunchFailed(format!("cannot wait for probe: {error}"));
+            }
+        }
+    };
+    let diagnostic = reader
+        .and_then(|reader| reader.join().ok())
+        .filter(|message| !message.trim().is_empty());
+    ProbeResult { outcome, diagnostic }
 }
 
-/// Runs `work` on each value on its own thread and returns the results in
-/// the order of `values`. A worker that panics reports an error for its value.
+/// Execute up to eight independent probes, retaining input ordering.
 fn probe_concurrently(
     values: &[u32],
-    work: impl Fn(u32) -> Result<bool, CliError> + Sync,
-) -> Vec<Result<bool, CliError>> {
+    work: impl Fn(u32) -> ProbeResult + Sync,
+) -> Vec<Result<ProbeResult, CliError>> {
     std::thread::scope(|scope| {
         let work = &work;
         let workers: Vec<_> = values
@@ -488,10 +710,10 @@ fn probe_concurrently(
         workers
             .into_iter()
             .map(|worker| {
-                worker.join().unwrap_or_else(|_| {
-                    Err(CliError(
+                worker.join().map_err(|_| {
+                    CliError(
                         "an isolated probe worker panicked; re-run with --jobs 1".to_string(),
-                    ))
+                    )
                 })
             })
             .collect()
@@ -648,9 +870,9 @@ fn report_interrupted(args: &LimitsArgs, last_ok: Option<u32>) -> Result<(), Cli
 }
 
 /// The hidden probe entry point: performs exactly one invocation and
-/// returns `Ok(())` (exit 0) or `Err` (exit 1) — no measurement, no
-/// output. Run in its own process by [`run`].
-pub fn run_probe(args: ProbeArgs) -> Result<(), CliError> {
+/// returns acceptance separately from setup errors. The CLI assigns a
+/// dedicated exit code to contract rejection.
+pub fn run_probe(args: ProbeArgs) -> Result<bool, CliError> {
     let _quiet = QuietPanics::install();
     let bool_defaults = parse_bool_defaults(&args.bool_defaults)?;
     let (contract_id, env, function, ramp_index) =
@@ -658,11 +880,13 @@ pub fn run_probe(args: ProbeArgs) -> Result<(), CliError> {
     validate_bool_defaults(&function, &bool_defaults)?;
     let args_vec = build_args(&env, &function, ramp_index, &bool_defaults, args.value)?;
     let func = Symbol::new(&env, &args.function);
-    if invoke_succeeds(&env, &contract_id, &func, args_vec) {
-        Ok(())
-    } else {
-        Err(CliError("probe failed".to_string()))
+    let accepted = invoke_succeeds(&env, &contract_id, &func, args_vec);
+    if !accepted {
+        // The parent captures this only when --verbose is enabled. Normal
+        // runs keep the historical quiet behavior.
+        eprintln!("contract rejected {}={}", args.ramp, args.value);
     }
+    Ok(accepted)
 }
 
 fn measure(
@@ -727,21 +951,31 @@ fn load(
 
     let entries = soroban_spec::read::from_wasm(&wasm).map_err(|err| spec_error(contract, &err))?;
 
+    let constructor = entries.iter().find_map(|entry| match entry {
+        ScSpecEntry::FunctionV0(f) if f.name.to_string() == CONSTRUCTOR_NAME => Some(f.clone()),
+        _ => None,
+    });
     let func_spec = find_function_spec(entries, contract, function)?;
     let ramp_index = ramp_index_of(&func_spec, function, ramp)?;
 
     let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
         capture_snapshot_at_drop: false,
     });
-    // Keep the historical permissive mode for compatibility, but allow
-    // callers to constrain mocks to root authorization or disable them.
-    // Each probe owns a fresh Env, so these policies cannot leak between runs.
+    // Each probe owns a fresh Env. Apply the selected authorization policy
+    // without leaking mocks between probes.
     match auth_mode {
         AuthMode::All => env.mock_all_auths_allowing_non_root_auth(),
         AuthMode::RootOnly => env.mock_all_auths(),
         AuthMode::None => {}
     }
-    let contract_id = env.register(wasm.as_slice(), ());
+    // A contract with a constructor must be registered with its arguments, or
+    // it never initializes. Ramp parameters do not apply to the constructor,
+    // so every input receives its normal default.
+    let constructor_args = match &constructor {
+        Some(ctor) => build_args(&env, ctor, usize::MAX, &BTreeMap::new(), 0)?,
+        None => SVec::new(&env),
+    };
+    let contract_id = env.register(wasm.as_slice(), constructor_args);
 
     Ok((contract_id, env, func_spec, ramp_index))
 }
@@ -829,6 +1063,13 @@ fn find_function_spec(
     contract: &std::path::Path,
     function: &str,
 ) -> Result<ScSpecFunctionV0, CliError> {
+    if function.starts_with("__") {
+        return Err(CliError(format!(
+            "{} is a reserved contract name, not a function that can be ramped; \
+             the constructor runs at deployment and is handled automatically",
+            quote(function)
+        )));
+    }
     entries
         .into_iter()
         .find_map(|entry| match entry {
@@ -1052,15 +1293,21 @@ fn default_val(
         ScSpecTypeDef::String => Ok(soroban_sdk::String::from_str(env, "").into_val(env)),
         ScSpecTypeDef::Bytes => Ok(soroban_sdk::Bytes::new(env).into_val(env)),
         ScSpecTypeDef::Vec(_) => Ok(SVec::<Val>::new(env).into_val(env)),
+        // None: an omitted optional argument is the default a caller would send.
+        ScSpecTypeDef::Option(_) => Ok(Option::<u32>::None.into_val(env)),
         other => Err(CliError(format!(
             "parameter {} has type {}, which this command doesn't know how to \
              default yet; every parameter other than --ramp needs one of Address, bool, \
-             u32/i32/u64/i64/u128/i128, Symbol, String, Bytes or Vec",
+             u32/i32/u64/i64/u128/i128, Symbol, String, Bytes, Vec or Option",
             quote(input.name.to_utf8_string_lossy()),
             quote(type_name(other))
         ))),
     }
 }
+
+#[cfg(test)]
+#[path = "limits/probe_tests.rs"]
+mod probe_tests;
 
 /// Spec fixtures built by hand from the XDR types, so the parsing and
 /// ramp/default logic is tested for every supported `ScSpecTypeDef` without
@@ -1229,6 +1476,14 @@ mod tests {
     }
 
     #[test]
+    fn capped_search_is_not_a_measured_failure() {
+        let result = find_ladder_bounds(4, threshold_probe(u32::MAX)).unwrap();
+        assert_eq!(result, Search::Done((Some(SEARCH_CEILING), None)));
+        assert_eq!(boundary_kind(None), "search_cap_reached");
+        assert_eq!(boundary_kind(Some(SEARCH_CEILING)), "measured_failure");
+    }
+
+    #[test]
     fn a_failing_first_value_leaves_no_success() {
         assert_eq!(
             find_ladder_bounds(4, |values: &[u32]| Ok(Some(vec![false; values.len()]))).unwrap(),
@@ -1302,9 +1557,19 @@ mod tests {
         let results = probe_concurrently(&values, |value| {
             // Later values finish first, so completion order differs from input order.
             std::thread::sleep(std::time::Duration::from_millis(u64::from(10 - value)));
-            Ok(value % 2 == 1)
+            ProbeResult {
+                outcome: if value % 2 == 1 {
+                    ProbeExit::Success
+                } else {
+                    ProbeExit::ContractRejected
+                },
+                diagnostic: None,
+            }
         });
-        let outcomes: Vec<bool> = results.into_iter().map(|r| r.unwrap()).collect();
+        let outcomes: Vec<bool> = results
+            .into_iter()
+            .map(|r| r.unwrap().outcome == ProbeExit::Success)
+            .collect();
         assert_eq!(outcomes, vec![false, true, false, true]);
     }
 
@@ -1316,9 +1581,11 @@ mod tests {
                 function: "run".into(),
                 ramp: "amount".into(),
                 jobs,
+                probe_timeout: 120,
                 dry_run: false,
                 bool_defaults: Vec::new(),
                 auth_mode: AuthMode::All,
+                json: false,
             };
             let out = crate::commands::output::Output {
                 verbosity: crate::commands::output::Verbosity::Quiet,
@@ -1339,9 +1606,11 @@ mod tests {
             function: "run".into(),
             ramp: "amount".into(),
             jobs: 1,
+            probe_timeout: 120,
             dry_run: false,
             bool_defaults: Vec::new(),
             auth_mode: AuthMode::All,
+            json: false,
         };
         let err = report_interrupted(&args, None).expect_err("no successful result");
         assert!(err.0.contains("before any successful probe"));
@@ -1400,6 +1669,9 @@ mod tests {
             ScSpecTypeDef::String,
             ScSpecTypeDef::Bytes,
             vec_of(ScSpecTypeDef::U32),
+            ScSpecTypeDef::Option(Box::new(soroban_sdk::xdr::ScSpecTypeOption {
+                value_type: Box::new(ScSpecTypeDef::U32),
+            })),
         ]
     }
 
@@ -1681,3 +1953,4 @@ mod tests {
         assert!(err.0.contains("no contract spec"), "{err}");
     }
 }
+
