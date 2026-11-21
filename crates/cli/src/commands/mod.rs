@@ -60,6 +60,9 @@ pub enum Commands {
     ///   - Other parameters get fixed defaults: a generated Address (one
     ///     named `token` gets a funded Stellar Asset Contract), `false`, 1
     ///     for integers, Symbol `x`, and an empty String, Bytes or Vec. Map,
+    ///     Tuple, Option, Result and user-defined types are rejected.
+    ///   - `--auth-mode all` approves all authorization (default), `root-only` approves only root invocation auth, and `none` installs no auth mocks.
+    ///   - Non-ramp bool parameters default to false; repeat `--bool-default PARAM=true|false` to override them.
     ///     Tuple, Result and user-defined types are rejected.
     ///   - All authorization is mocked as approved.
     ///   - Ledger reads/writes and transaction size are not measured; they
