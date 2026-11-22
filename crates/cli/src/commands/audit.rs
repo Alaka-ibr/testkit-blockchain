@@ -31,8 +31,8 @@ pub struct AuditArgs {
     /// (for editor integrations that audit unsaved buffers)
     #[arg(value_name = "PATH", default_value = ".", verbatim_doc_comment)]
     path: PathBuf,
-    /// Exit 1 if any findings are reported. Without it, findings are
-    /// printed and the command still exits 0
+    /// Exit 1 if any findings are reported, or 2 if a file failed to parse.
+    /// Without it, findings are printed and the command still exits 0
     #[arg(long, verbatim_doc_comment)]
     strict: bool,
     /// Print findings as a JSON document (`schema_version` 1) on stdout
@@ -294,6 +294,22 @@ struct Skipped {
     message: String,
 }
 
+/// Exit status for `audit` when its input could not be audited: a PATH that is
+/// missing or unreadable, or, with `--strict`, a file that fails to parse. See
+/// `EXIT STATUS` in `--help`.
+pub const INVALID_INPUT_EXIT_CODE: i32 = 2;
+
+/// How an `audit` run that read its input ended. Invalid input is an error,
+/// not a status (see [`run`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum AuditStatus {
+    /// The scan completed. Findings, if any, do not fail the run unless
+    /// `--strict` is passed.
+    Pass,
+    /// `--strict` was passed and this many findings were reported.
+    StrictFindings(usize),
+}
+
 #[derive(Debug)]
 struct Finding {
     /// See [`finding_path`].
@@ -326,7 +342,7 @@ struct Finding {
 /// directory the command runs from. `--include`/`--exclude` globs match
 /// those same paths (see [`PathFilter`]). Files that do not parse are
 /// listed as skipped, with the parser's position and message.
-pub fn run(args: AuditArgs, out: Output) -> Result<(), CliError> {
+pub fn run(args: AuditArgs, out: Output) -> Result<AuditStatus, CliError> {
     let rules =
         selected_rules(&args.rules, &args.exclude_rules).unwrap_or_else(|msg| usage_error(msg));
     let all_rules = rules.len() == Rule::ALL.len();
@@ -423,6 +439,17 @@ pub fn run(args: AuditArgs, out: Output) -> Result<(), CliError> {
             );
         }
     }
+    // A file that does not parse is not audited. Without --strict it is
+    // reported above and the run goes on. With --strict the run is invalid
+    // input, because a clean result would hide a file nobody checked.
+    if args.strict && !skipped.is_empty() {
+        let files: Vec<&str> = skipped.iter().map(|skip| skip.file.as_str()).collect();
+        return Err(CliError(format!(
+            "{} file(s) failed to parse and were not audited (--strict): {}",
+            skipped.len(),
+            files.join(", ")
+        )));
+    }
     let skipped_note = match skipped.len() {
         0 => String::new(),
         1 => " 1 file could not be parsed and was not audited (see the warning above).".to_string(),
@@ -456,12 +483,9 @@ pub fn run(args: AuditArgs, out: Output) -> Result<(), CliError> {
     }
 
     if args.strict && !findings.is_empty() {
-        return Err(CliError(format!(
-            "{} audit finding(s) (--strict)",
-            findings.len()
-        )));
+        return Ok(AuditStatus::StrictFindings(findings.len()));
     }
-    Ok(())
+    Ok(AuditStatus::Pass)
 }
 
 /// Renders findings as the `audit --json` document, schema version
@@ -1605,6 +1629,101 @@ impl Vault {
         assert!(
             json.ends_with(",\"finding_count\":0,\"findings\":[]}"),
             "{json}"
+        );
+    }
+
+    /// A uniquely named temp directory for one status test, removed on drop.
+    struct StatusDir(PathBuf);
+
+    impl StatusDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "soroban-testkit-audit-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn write(&self, name: &str, source: &str) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, source).unwrap();
+            path
+        }
+    }
+
+    impl Drop for StatusDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn audit_status(path: &Path, strict: bool) -> Result<AuditStatus, CliError> {
+        let out = Output {
+            verbosity: crate::commands::output::Verbosity::Quiet,
+            color: false,
+        };
+        run(
+            AuditArgs {
+                path: path.to_path_buf(),
+                strict,
+                json: false,
+                rules: Vec::new(),
+                exclude_rules: Vec::new(),
+                include: Vec::new(),
+                exclude: Vec::new(),
+            },
+            out,
+        )
+    }
+
+    #[test]
+    fn a_clean_scan_passes_with_or_without_strict() {
+        let dir = StatusDir::new("clean");
+        let path = dir.write(
+            "lib.rs",
+            "pub fn add(a: u32, b: u32) -> u32 { a.wrapping_add(b) }\n",
+        );
+        assert_eq!(audit_status(&path, false).unwrap(), AuditStatus::Pass);
+        assert_eq!(audit_status(&path, true).unwrap(), AuditStatus::Pass);
+    }
+
+    #[test]
+    fn findings_pass_without_strict_and_fail_with_it() {
+        let dir = StatusDir::new("findings");
+        let path = dir.write("lib.rs", "pub fn pay(from: Address) -> u32 { 1 }\n");
+        assert_eq!(audit_status(&path, false).unwrap(), AuditStatus::Pass);
+        assert_eq!(
+            audit_status(&path, true).unwrap(),
+            AuditStatus::StrictFindings(1)
+        );
+    }
+
+    #[test]
+    fn a_missing_path_is_invalid_input() {
+        let err = audit_status(Path::new("does/not/exist-audit-status"), false).unwrap_err();
+        assert!(
+            err.0
+                .starts_with("cannot audit `does/not/exist-audit-status`: "),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unparsable_file_is_skipped_unless_strict() {
+        let dir = StatusDir::new("unparsable");
+        dir.write("broken.rs", "pub fn {{{{{");
+        dir.write("lib.rs", "pub fn pay(from: Address) -> u32 { 1 }\n");
+        // Without --strict the broken file is skipped with a warning, and the
+        // rest of the scan still counts.
+        assert_eq!(audit_status(&dir.0, false).unwrap(), AuditStatus::Pass);
+        // With --strict an unaudited file is invalid input, not a clean run.
+        let err = audit_status(&dir.0, true).unwrap_err();
+        assert!(
+            err.0
+                .contains("1 file(s) failed to parse and were not audited (--strict): broken.rs"),
+            "{err}"
         );
     }
 }
