@@ -48,23 +48,32 @@ pub enum Commands {
     /// Find the largest input a contract function handles before it fails
     ///
     /// Invokes --fn on the compiled .wasm in a local Soroban host (no
-    /// network), increasing the --ramp parameter: doubling from 1 until a
-    /// call fails, then binary-searching between the last success and the
-    /// first failure. Each attempt runs in its own subprocess. Values above
-    /// 16777216 (2^24) are not tried. Prints the last successful value with
-    /// the CPU instructions and memory bytes it used.
+    /// network), increasing the --ramp parameter: doubling from 0 (then 1,
+    /// 2, 4, ...) until a call fails, then binary-searching between the last
+    /// success and the first failure. Each attempt runs in its own
+    /// subprocess. Values above 16777216 (2^24) are not tried, and a Vec ramp
+    /// stops at 1024 items. Prints the last successful value with the CPU
+    /// instructions and memory bytes it used.
     ///
     /// Limitations:
-    ///   - --ramp must be u32/i32/u64/i64/u128/i128 (ramped as the value
-    ///     itself) or `Vec<Address>` (ramped as its length).
-    ///   - Other parameters get fixed defaults: a generated Address (one
-    ///     named `token` gets a funded Stellar Asset Contract), `false`, 1
-    ///     for integers, Symbol `x`, and an empty String, Bytes or Vec. Map,
-    ///     Tuple, Option, Result and user-defined types are rejected.
-    ///   - `--auth-mode all` approves all authorization (default), `root-only` approves only root invocation auth, and `none` installs no auth mocks.
-    ///   - Non-ramp bool parameters default to false; repeat `--bool-default PARAM=true|false` to override them.
-    ///     Tuple, Result and user-defined types are rejected.
-    ///   - All authorization is mocked as approved.
+    ///   - --ramp accepts u32/i32/u64/i64/u128/i128 (ramped as the value) and
+    ///     `Vec<T>` (ramped as its length), where T is Address, bool, an
+    ///     integer, Symbol, String or Bytes. Each `Vec<Address>` item is a
+    ///     distinct generated address.
+    ///   - Other parameters get these defaults: Address, a generated address
+    ///     (a parameter named `token` gets a funded Stellar Asset Contract);
+    ///     bool, false (or the value of --bool-default); u32, i32, u64, i64,
+    ///     u128 and i128, 1; Symbol, `x`; String and Bytes, empty; Vec<T>,
+    ///     empty; Option<T>, None.
+    ///   - Rejected with an error that names the type: Map, Tuple, Result,
+    ///     BytesN, U256, I256, Timepoint, Duration, Val, Error, Void,
+    ///     MuxedAddress and user-defined types. A Vec<T> with one of these
+    ///     elements is rejected as a ramp, though it still defaults to empty.
+    ///   - --auth-mode sets how authorization is mocked: all (default)
+    ///     approves every entry, root-only approves only root invocation
+    ///     auth, and none installs no mocks.
+    ///   - --repeat N measures the final value N times and reports the median
+    ///     with its min and max.
     ///   - Ledger reads/writes and transaction size are not measured; they
     ///     need network-backed transaction simulation.
     #[command(verbatim_doc_comment)]

@@ -72,7 +72,8 @@ mod signals {
 #[derive(Args)]
 #[command(after_help = "EXAMPLES:\n    \
     soroban-testkit limits --contract target/wasm32v1-none/release/my_contract.wasm --fn batch_payout --ramp recipients\n    \
-    soroban-testkit limits --contract my_contract.wasm --fn transfer --ramp amount")]
+    soroban-testkit limits --contract my_contract.wasm --fn transfer --ramp amount\n    \
+    soroban-testkit limits --contract my_contract.wasm --fn transfer --ramp amount --bool-default paused=true --repeat 5")]
 pub struct LimitsArgs {
     /// Path to the compiled contract .wasm file
     /// (e.g. `target/wasm32v1-none/release/<crate>.wasm`)
@@ -82,7 +83,7 @@ pub struct LimitsArgs {
     #[arg(long = "fn", value_name = "NAME")]
     function: String,
     /// The parameter of --fn to increase on each attempt: an integer type
-    /// (ramped as the value) or `Vec<Address>` (ramped as its length)
+    /// (ramped as the value) or `Vec<T>` (ramped as its length)
     #[arg(long, value_name = "PARAM", verbatim_doc_comment)]
     ramp: String,
     // Results are read back in ramp order, so the boundary matches a sequential
@@ -93,6 +94,9 @@ pub struct LimitsArgs {
     /// Stop an individual probe after N seconds (default 120; minimum 1).
     #[arg(long, value_name = "SECONDS", default_value_t = 120)]
     probe_timeout: u64,
+    /// Measure the final value N times (1 to 16, default 1). With N above 1, the report gives the median with the min and max.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    repeat: usize,
     /// Generate and print one probe's arguments without invoking the contract.
     /// This validates the contract spec and is useful when diagnosing defaults.
     #[arg(long)]
@@ -129,13 +133,20 @@ impl AuthMode {
         }
     }
 }
-}
+
+/// Largest accepted `--repeat`. Each repeat is one more in-process measurement.
+pub const MAX_REPEATS: usize = 16;
 
 /// Largest accepted `--jobs`. Each concurrent probe is a full child process.
 pub const MAX_JOBS: usize = 8;
 
 /// Largest ramp value tried while doubling. Values above it are never probed.
 const SEARCH_CEILING: u32 = 1 << 24;
+
+/// Largest number of items a `Vec` ramp generates for one probe. The search for
+/// a `Vec` parameter stops here, so no probe allocates more items than this.
+const MAX_VEC_RAMP_ITEMS: u32 = 1024;
+
 const MAX_PROBE_STDERR_BYTES: usize = 8 * 1024;
 pub const PROBE_REJECTED_EXIT_CODE: i32 = 10;
 
@@ -273,6 +284,12 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
             "--probe-timeout must be at least 1 second".to_string(),
         ));
     }
+    if args.repeat == 0 || args.repeat > MAX_REPEATS {
+        return Err(CliError(format!(
+            "--repeat must be between 1 and {MAX_REPEATS} (got {})",
+            args.repeat
+        )));
+    }
     let _signal_guard = signals::SignalGuard::install();
     // Validate the configuration (function exists, ramp parameter exists,
     // every parameter's type is one this command knows how to default or
@@ -362,8 +379,10 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
         Ok(Some(outcomes))
     };
 
-    // Find a failing upper bound by doubling.
-    let (ladder_ok, ladder_failed) = match find_ladder_bounds(args.jobs, &mut probe_batch)? {
+    // Find a failing upper bound by doubling. A Vec ramp stops at its item cap.
+    let ceiling = ramp_ceiling(&function.inputs[ramp_index].type_);
+    let (ladder_ok, ladder_failed) = match find_ladder_bounds(args.jobs, ceiling, &mut probe_batch)?
+    {
         Search::Done(bounds) => bounds,
         Search::Cancelled { last_ok } => return report_interrupted(&args, last_ok),
     };
@@ -420,24 +439,52 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
     }
     drop(env);
 
-    // Measure resources at the best-known-good value, in-process this
-    // time (a known-successful call is safe to make directly).
-    let (instructions, memory_bytes) = measure(&args, best, &bool_defaults)?;
+    // Measure resources at the best-known-good value, in-process this time
+    // (a known-successful call is safe to make directly). Every repeat builds
+    // a fresh environment, so the spread shows run-to-run variation.
+    let mut cpu_samples = Vec::with_capacity(args.repeat);
+    let mut memory_samples = Vec::with_capacity(args.repeat);
+    for _ in 0..args.repeat {
+        let (instructions, memory_bytes) = measure(&args, best, &bool_defaults)?;
+        cpu_samples.push(instructions);
+        memory_samples.push(memory_bytes);
+    }
+    let measured = Measured {
+        instructions: Spread::of(cpu_samples),
+        memory_bytes: Spread::of(memory_samples),
+    };
+    // For a Vec ramp, the ramp value is the number of items generated.
+    let generated_items =
+        matches!(function.inputs[ramp_index].type_, ScSpecTypeDef::Vec(_)).then_some(best);
 
     if args.json {
         println!(
             "{}",
-            render_json(&args, best, instructions, memory_bytes, first_failing, failure_kind)
+            render_json(
+                &args,
+                best,
+                &measured,
+                first_failing,
+                failure_kind,
+                ceiling,
+                generated_items,
+            )
         );
         return Ok(());
     }
 
+    // A Vec ramp's value is an item count, so say what the number counts.
+    let unit = if generated_items.is_some() {
+        " generated items"
+    } else {
+        ""
+    };
     println!(
-        "last successful {} for {:?}: {best}",
+        "last successful {} for {:?}: {best}{unit}",
         args.ramp, args.function
     );
-    println!("  instructions (CPU cycles): {instructions}");
-    println!("  memory (bytes): {memory_bytes}");
+    println!("  instructions: {}", measured.instructions.describe());
+    println!("  memory bytes: {}", measured.memory_bytes.describe());
     match first_failing {
         Some(value) => println!(
             "  first failing {}: {value} ({})",
@@ -445,7 +492,7 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
             failure_kind.unwrap_or("unknown")
         ),
         None => println!(
-            "  search capped at {SEARCH_CEILING}; no failing probe observed (not a measured maximum)"
+            "  search capped at {ceiling}; no failing probe observed (not a measured maximum)"
         ),
     }
     out.note(
@@ -456,14 +503,60 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Renders the result as the `limits --json` document.
+/// Repeated samples of one resource, summarized. The median of an even count
+/// is its lower middle value, so every reported figure was actually observed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Spread {
+    min: u64,
+    median: u64,
+    max: u64,
+    samples: usize,
+}
+
+impl Spread {
+    fn of(mut samples: Vec<u64>) -> Self {
+        samples.sort_unstable();
+        let last = samples.len().saturating_sub(1);
+        Self {
+            min: samples.first().copied().unwrap_or(0),
+            median: samples.get(last / 2).copied().unwrap_or(0),
+            max: samples.last().copied().unwrap_or(0),
+            samples: samples.len(),
+        }
+    }
+
+    /// The text report's figure: the value alone for one sample, otherwise the
+    /// median with the range it came from.
+    fn describe(&self) -> String {
+        if self.samples == 1 {
+            self.median.to_string()
+        } else {
+            format!(
+                "{} (median of {}; min {}, max {})",
+                self.median, self.samples, self.min, self.max
+            )
+        }
+    }
+}
+
+/// The measured cost of the final ramp value, for both reported resources.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Measured {
+    instructions: Spread,
+    memory_bytes: Spread,
+}
+
+/// Renders the result as the `limits --json` document. `instructions` and
+/// `memory_bytes` are the medians; `measurements` carries each full spread.
+/// `generated_items` is set only for a `Vec` ramp.
 fn render_json(
     args: &LimitsArgs,
     best: u32,
-    instructions: u64,
-    memory_bytes: u64,
+    measured: &Measured,
     first_failing: Option<u32>,
     failure_kind: Option<&str>,
+    ceiling: u32,
+    generated_items: Option<u32>,
 ) -> String {
     serde_json::json!({
         "schema_version": LIMITS_JSON_SCHEMA_VERSION,
@@ -471,11 +564,25 @@ fn render_json(
         "function": args.function,
         "ramp": args.ramp,
         "last_successful": best,
-        "instructions": instructions,
-        "memory_bytes": memory_bytes,
+        "generated_items": generated_items,
+        "instructions": measured.instructions.median,
+        "memory_bytes": measured.memory_bytes.median,
+        "measurements": {
+            "repeats": measured.instructions.samples,
+            "instructions": {
+                "min": measured.instructions.min,
+                "median": measured.instructions.median,
+                "max": measured.instructions.max,
+            },
+            "memory_bytes": {
+                "min": measured.memory_bytes.min,
+                "median": measured.memory_bytes.median,
+                "max": measured.memory_bytes.max,
+            },
+        },
         "boundary": {
             "kind": boundary_kind(first_failing),
-            "search_ceiling": SEARCH_CEILING,
+            "search_ceiling": ceiling,
             "first_failing": first_failing,
             "failure_outcome": failure_kind,
         },
@@ -720,18 +827,18 @@ fn probe_concurrently(
     })
 }
 
-/// The doubling ladder value after `value`, or `None` past [`SEARCH_CEILING`].
-fn ladder_successor(value: u32) -> Option<u32> {
+/// The doubling ladder value after `value`, or `None` past `ceiling`.
+fn ladder_successor(value: u32, ceiling: u32) -> Option<u32> {
     if value == 0 {
-        Some(1)
+        Some(1).filter(|next| *next <= ceiling)
     } else {
-        value.checked_mul(2).filter(|next| *next <= SEARCH_CEILING)
+        value.checked_mul(2).filter(|next| *next <= ceiling)
     }
 }
 
 /// Up to `jobs` consecutive ladder values starting at `start`, never past
-/// [`SEARCH_CEILING`]. A `jobs` of 0 is treated as 1.
-fn ladder_batch(start: u32, jobs: usize) -> Vec<u32> {
+/// `ceiling`. A `jobs` of 0 is treated as 1.
+fn ladder_batch(start: u32, jobs: usize, ceiling: u32) -> Vec<u32> {
     let mut batch = Vec::new();
     let mut current = Some(start);
     while let Some(value) = current {
@@ -739,7 +846,7 @@ fn ladder_batch(start: u32, jobs: usize) -> Vec<u32> {
             break;
         }
         batch.push(value);
-        current = ladder_successor(value);
+        current = ladder_successor(value, ceiling);
     }
     batch
 }
@@ -751,14 +858,18 @@ type LadderBounds = (Option<u32>, Option<u32>);
 /// batch in order, and stops at the first failure. Returns the last success
 /// and the first failure. Both are `None` when the search reached the ceiling
 /// without failing.
-fn find_ladder_bounds<P>(jobs: usize, mut probe_batch: P) -> Result<Search<LadderBounds>, CliError>
+fn find_ladder_bounds<P>(
+    jobs: usize,
+    ceiling: u32,
+    mut probe_batch: P,
+) -> Result<Search<LadderBounds>, CliError>
 where
     P: FnMut(&[u32]) -> Result<Option<Vec<bool>>, CliError>,
 {
     let mut last_ok = None;
     let mut next = Some(if ENABLE_ZERO_PROBE { 0u32 } else { 1u32 });
     while let Some(start) = next {
-        let batch = ladder_batch(start, jobs);
+        let batch = ladder_batch(start, jobs, ceiling);
         let Some(results) = probe_batch(&batch)? else {
             return Ok(Search::Cancelled { last_ok });
         };
@@ -767,7 +878,7 @@ where
                 return Ok(Search::Done((last_ok, Some(value))));
             }
             last_ok = Some(value);
-            next = ladder_successor(value);
+            next = ladder_successor(value, ceiling);
         }
     }
     Ok(Search::Done((last_ok, None)))
@@ -1223,19 +1334,61 @@ fn ramp_val(env: &Env, type_: &ScSpecTypeDef, ramp_value: u32) -> Result<Val, Cl
         ScSpecTypeDef::I64 => Ok((ramp_value as i64).into_val(env)),
         ScSpecTypeDef::U128 => Ok((ramp_value as u128).into_val(env)),
         ScSpecTypeDef::I128 => Ok((ramp_value as i128).into_val(env)),
-        ScSpecTypeDef::Vec(inner) if matches!(*inner.element_type, ScSpecTypeDef::Address) => {
-            let mut addrs = SVec::new(env);
-            for _ in 0..ramp_value {
-                addrs.push_back(Address::generate(env));
+        ScSpecTypeDef::Vec(inner) => {
+            let element = &inner.element_type;
+            // Checked before the loop, so an unsupported element type is
+            // rejected even when the ramp value is 0.
+            ramp_item(env, element)?;
+            if ramp_value > MAX_VEC_RAMP_ITEMS {
+                return Err(CliError(format!(
+                    "a Vec ramp generates at most {MAX_VEC_RAMP_ITEMS} items; refusing {ramp_value}"
+                )));
             }
-            Ok(addrs.into_val(env))
+            let mut items = SVec::<Val>::new(env);
+            for _ in 0..ramp_value {
+                items.push_back(ramp_item(env, element)?);
+            }
+            Ok(items.into_val(env))
         }
-        other => Err(CliError(format!(
-            "the ramp parameter's type ({}) isn't supported yet; supported ramp types \
-             are u32/i32/u64/i64/u128/i128 and Vec<Address>",
-            quote(type_name(other))
-        ))),
+        other => Err(unsupported_ramp_type(other)),
     }
+}
+
+/// The largest ramp value the search may try for a parameter of this type. A
+/// `Vec` is capped at [`MAX_VEC_RAMP_ITEMS`]; integers use [`SEARCH_CEILING`].
+fn ramp_ceiling(type_: &ScSpecTypeDef) -> u32 {
+    match type_ {
+        ScSpecTypeDef::Vec(_) => MAX_VEC_RAMP_ITEMS,
+        _ => SEARCH_CEILING,
+    }
+}
+
+/// One item of a ramped `Vec`. Addresses are distinct; every other element
+/// gets the value [`default_val`] would give that type.
+fn ramp_item(env: &Env, element: &ScSpecTypeDef) -> Result<Val, CliError> {
+    Ok(match element {
+        ScSpecTypeDef::Address => Address::generate(env).into_val(env),
+        ScSpecTypeDef::Bool => false.into_val(env),
+        ScSpecTypeDef::U32 => 1u32.into_val(env),
+        ScSpecTypeDef::I32 => 1i32.into_val(env),
+        ScSpecTypeDef::U64 => 1u64.into_val(env),
+        ScSpecTypeDef::I64 => 1i64.into_val(env),
+        ScSpecTypeDef::U128 => 1u128.into_val(env),
+        ScSpecTypeDef::I128 => 1i128.into_val(env),
+        ScSpecTypeDef::Symbol => Symbol::new(env, "x").into_val(env),
+        ScSpecTypeDef::String => soroban_sdk::String::from_str(env, "").into_val(env),
+        ScSpecTypeDef::Bytes => soroban_sdk::Bytes::new(env).into_val(env),
+        other => return Err(unsupported_ramp_type(other)),
+    })
+}
+
+fn unsupported_ramp_type(type_: &ScSpecTypeDef) -> CliError {
+    CliError(format!(
+        "the ramp parameter's type ({}) isn't supported yet; supported ramp types \
+         are u32/i32/u64/i64/u128/i128 and Vec<T> where T is Address, bool, an \
+         integer, Symbol, String or Bytes",
+        quote(type_name(type_))
+    ))
 }
 
 fn default_val(
@@ -1432,10 +1585,11 @@ mod tests {
 
     /// The boundary `run` reports for `threshold`: doubling, then refinement.
     fn boundary_for(threshold: u32, jobs: usize) -> Option<u32> {
-        let bounds = match find_ladder_bounds(jobs, threshold_probe(threshold)).unwrap() {
-            Search::Done(bounds) => bounds,
-            Search::Cancelled { .. } => unreachable!("no cancellation in this test"),
-        };
+        let bounds =
+            match find_ladder_bounds(jobs, SEARCH_CEILING, threshold_probe(threshold)).unwrap() {
+                Search::Done(bounds) => bounds,
+                Search::Cancelled { .. } => unreachable!("no cancellation in this test"),
+            };
         let (last_ok, first_failed) = bounds;
         let last_ok = last_ok?;
         let Some(hi) = first_failed else {
@@ -1477,7 +1631,7 @@ mod tests {
 
     #[test]
     fn capped_search_is_not_a_measured_failure() {
-        let result = find_ladder_bounds(4, threshold_probe(u32::MAX)).unwrap();
+        let result = find_ladder_bounds(4, SEARCH_CEILING, threshold_probe(u32::MAX)).unwrap();
         assert_eq!(result, Search::Done((Some(SEARCH_CEILING), None)));
         assert_eq!(boundary_kind(None), "search_cap_reached");
         assert_eq!(boundary_kind(Some(SEARCH_CEILING)), "measured_failure");
@@ -1486,7 +1640,10 @@ mod tests {
     #[test]
     fn a_failing_first_value_leaves_no_success() {
         assert_eq!(
-            find_ladder_bounds(4, |values: &[u32]| Ok(Some(vec![false; values.len()]))).unwrap(),
+            find_ladder_bounds(4, SEARCH_CEILING, |values: &[u32]| {
+                Ok(Some(vec![false; values.len()]))
+            })
+            .unwrap(),
             Search::Done((None, Some(0)))
         );
     }
@@ -1495,16 +1652,17 @@ mod tests {
     fn zero_probe_starts_at_zero_when_enabled() {
         // When ENABLE_ZERO_PROBE is true, the first probe should be at 0
         assert_eq!(
-            ladder_batch(if ENABLE_ZERO_PROBE { 0 } else { 1 }, 1),
+            ladder_batch(if ENABLE_ZERO_PROBE { 0 } else { 1 }, 1, SEARCH_CEILING),
             vec![if ENABLE_ZERO_PROBE { 0 } else { 1 }]
         );
     }
 
     #[test]
     fn ladder_successor_handles_zero() {
-        assert_eq!(ladder_successor(0), Some(1));
-        assert_eq!(ladder_successor(1), Some(2));
-        assert_eq!(ladder_successor(2), Some(4));
+        assert_eq!(ladder_successor(0, SEARCH_CEILING), Some(1));
+        assert_eq!(ladder_successor(1, SEARCH_CEILING), Some(2));
+        assert_eq!(ladder_successor(2, SEARCH_CEILING), Some(4));
+        assert_eq!(ladder_successor(0, 0), None);
     }
 
     #[test]
@@ -1516,7 +1674,8 @@ mod tests {
                 largest_batch = largest_batch.max(values.len());
                 inner(values)
             };
-            let Search::Done((Some(lo), Some(hi))) = find_ladder_bounds(jobs, &mut probe).unwrap()
+            let Search::Done((Some(lo), Some(hi))) =
+                find_ladder_bounds(jobs, SEARCH_CEILING, &mut probe).unwrap()
             else {
                 panic!("expected a bracket around 1000 for jobs {jobs}");
             };
@@ -1537,18 +1696,23 @@ mod tests {
             }
         };
         assert_eq!(
-            find_ladder_bounds(2, &mut probe).unwrap(),
+            find_ladder_bounds(2, SEARCH_CEILING, &mut probe).unwrap(),
             Search::Cancelled { last_ok: Some(1) }
         );
     }
 
     #[test]
     fn ladder_batches_double_and_stop_at_the_ceiling() {
-        assert_eq!(ladder_batch(1, 1), vec![1]);
-        assert_eq!(ladder_batch(1, 3), vec![1, 2, 4]);
-        assert_eq!(ladder_batch(1 << 23, 4), vec![1 << 23, 1 << 24]);
-        assert_eq!(ladder_batch(1 << 24, 4), vec![1 << 24]);
-        assert_eq!(ladder_batch(2, 0), vec![2]);
+        assert_eq!(ladder_batch(1, 1, SEARCH_CEILING), vec![1]);
+        assert_eq!(ladder_batch(1, 3, SEARCH_CEILING), vec![1, 2, 4]);
+        assert_eq!(
+            ladder_batch(1 << 23, 4, SEARCH_CEILING),
+            vec![1 << 23, 1 << 24]
+        );
+        assert_eq!(ladder_batch(1 << 24, 4, SEARCH_CEILING), vec![1 << 24]);
+        assert_eq!(ladder_batch(2, 0, SEARCH_CEILING), vec![2]);
+        // A Vec ramp stops at its own, much smaller, item cap.
+        assert_eq!(ladder_batch(512, 4, MAX_VEC_RAMP_ITEMS), vec![512, 1024]);
     }
 
     #[test]
@@ -1582,6 +1746,7 @@ mod tests {
                 ramp: "amount".into(),
                 jobs,
                 probe_timeout: 120,
+                repeat: 1,
                 dry_run: false,
                 bool_defaults: Vec::new(),
                 auth_mode: AuthMode::All,
@@ -1607,6 +1772,7 @@ mod tests {
             ramp: "amount".into(),
             jobs: 1,
             probe_timeout: 120,
+            repeat: 1,
             dry_run: false,
             bool_defaults: Vec::new(),
             auth_mode: AuthMode::All,
@@ -1951,6 +2117,187 @@ mod tests {
 
         let err = spec_error(path, &soroban_spec::read::FromWasmError::NotFound);
         assert!(err.0.contains("no contract spec"), "{err}");
+    }
+
+    /// Every spec type `limits` can meet, with how it is treated: whether a
+    /// non-ramp parameter of that type gets a default, and whether it can be
+    /// ramped. This table is the support list `limits --help` documents.
+    fn spec_type_table() -> Vec<(ScSpecTypeDef, bool, bool)> {
+        let option_u32 = ScSpecTypeDef::Option(Box::new(ScSpecTypeOption {
+            value_type: Box::new(ScSpecTypeDef::U32),
+        }));
+        let map = ScSpecTypeDef::Map(Box::new(ScSpecTypeMap {
+            key_type: Box::new(ScSpecTypeDef::Symbol),
+            value_type: Box::new(ScSpecTypeDef::U32),
+        }));
+        vec![
+            (ScSpecTypeDef::Val, false, false),
+            (ScSpecTypeDef::Bool, true, false),
+            (ScSpecTypeDef::Void, false, false),
+            (ScSpecTypeDef::Error, false, false),
+            (ScSpecTypeDef::U32, true, true),
+            (ScSpecTypeDef::I32, true, true),
+            (ScSpecTypeDef::U64, true, true),
+            (ScSpecTypeDef::I64, true, true),
+            (ScSpecTypeDef::Timepoint, false, false),
+            (ScSpecTypeDef::Duration, false, false),
+            (ScSpecTypeDef::U128, true, true),
+            (ScSpecTypeDef::I128, true, true),
+            (ScSpecTypeDef::U256, false, false),
+            (ScSpecTypeDef::I256, false, false),
+            (ScSpecTypeDef::Bytes, true, false),
+            (ScSpecTypeDef::String, true, false),
+            (ScSpecTypeDef::Symbol, true, false),
+            (ScSpecTypeDef::Address, true, false),
+            (ScSpecTypeDef::MuxedAddress, false, false),
+            (option_u32, true, false),
+            (
+                ScSpecTypeDef::Result(Box::new(ScSpecTypeResult {
+                    ok_type: Box::new(ScSpecTypeDef::Void),
+                    error_type: Box::new(ScSpecTypeDef::Error),
+                })),
+                false,
+                false,
+            ),
+            (vec_of(ScSpecTypeDef::Address), true, true),
+            (vec_of(ScSpecTypeDef::U32), true, true),
+            (vec_of(ScSpecTypeDef::Symbol), true, true),
+            (vec_of(ScSpecTypeDef::Bool), true, true),
+            (vec_of(ScSpecTypeDef::Bytes), true, true),
+            (map, false, false),
+            (
+                ScSpecTypeDef::Tuple(Box::new(ScSpecTypeTuple {
+                    value_types: vec![ScSpecTypeDef::I128, ScSpecTypeDef::Symbol]
+                        .try_into()
+                        .expect("two types fit"),
+                })),
+                false,
+                false,
+            ),
+            (
+                ScSpecTypeDef::BytesN(ScSpecTypeBytesN { n: 32 }),
+                false,
+                false,
+            ),
+            (
+                ScSpecTypeDef::Udt(ScSpecTypeUdt {
+                    name: "DataKey".try_into().expect("name fits"),
+                }),
+                false,
+                false,
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_spec_type_defaults_and_ramps_as_documented() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        for (ty, can_default, can_ramp) in spec_type_table() {
+            let fixture = input("param", ty.clone());
+            let defaulted = default_val(&env, &admin, &ty, &fixture, None);
+            assert_eq!(defaulted.is_ok(), can_default, "default for {ty:?}");
+            if let Err(err) = defaulted {
+                assert!(err.0.contains(&quote(type_name(&ty))), "{err}");
+                assert_no_debug_output(&err);
+            }
+
+            let ramped = ramp_val(&env, &ty, 2);
+            assert_eq!(ramped.is_ok(), can_ramp, "ramp for {ty:?}");
+            if let Err(err) = ramped {
+                assert!(err.0.contains(&quote(type_name(&ty))), "{err}");
+                assert_no_debug_output(&err);
+            }
+        }
+    }
+
+    #[test]
+    fn vec_ramps_generate_exactly_the_requested_addresses() {
+        use soroban_sdk::TryFromVal;
+
+        let env = Env::default();
+        let addresses = vec_of(ScSpecTypeDef::Address);
+        let decode = |ramp: u32| {
+            let val = ramp_val(&env, &addresses, ramp).unwrap();
+            SVec::<Address>::try_from_val(&env, &val).unwrap()
+        };
+
+        // An empty vector is a valid probe, and it is still a real Vec.
+        assert_eq!(decode(0).len(), 0);
+        let three = decode(3);
+        assert_eq!(three.len(), 3);
+        assert_ne!(
+            three.get(0),
+            three.get(1),
+            "each item is a distinct address"
+        );
+
+        // The cap is inclusive; one more item is refused before any is generated.
+        assert_eq!(decode(MAX_VEC_RAMP_ITEMS).len(), MAX_VEC_RAMP_ITEMS);
+        let err = ramp_val(&env, &addresses, MAX_VEC_RAMP_ITEMS + 1).expect_err("above the cap");
+        assert!(err.0.contains("at most 1024 items"), "{err}");
+        assert_eq!(ramp_ceiling(&addresses), MAX_VEC_RAMP_ITEMS);
+        assert_eq!(ramp_ceiling(&ScSpecTypeDef::U32), SEARCH_CEILING);
+    }
+
+    #[test]
+    fn vec_ramps_fill_scalar_elements_with_their_default_value() {
+        use soroban_sdk::TryFromVal;
+
+        let env = Env::default();
+        let val = ramp_val(&env, &vec_of(ScSpecTypeDef::U32), 4).unwrap();
+        let numbers = SVec::<u32>::try_from_val(&env, &val).unwrap();
+        assert_eq!(numbers.len(), 4);
+        assert!((0..numbers.len()).all(|i| numbers.get(i) == Some(1)));
+
+        // A Vec whose element has no default is refused, even at length 0.
+        let map = ScSpecTypeDef::Map(Box::new(ScSpecTypeMap {
+            key_type: Box::new(ScSpecTypeDef::Symbol),
+            value_type: Box::new(ScSpecTypeDef::U32),
+        }));
+        let err = ramp_val(&env, &vec_of(map), 0).expect_err("Map elements cannot be ramped");
+        assert!(err.0.contains("`Map<Symbol, u32>`"), "{err}");
+        assert_no_debug_output(&err);
+    }
+
+    #[test]
+    fn repeat_samples_summarize_with_a_lower_median() {
+        let odd = Spread::of(vec![9, 3, 5]);
+        assert_eq!((odd.min, odd.median, odd.max, odd.samples), (3, 5, 9, 3));
+        assert_eq!(odd.describe(), "5 (median of 3; min 3, max 9)");
+
+        let even = Spread::of(vec![8, 2, 6, 4]);
+        assert_eq!((even.min, even.median, even.max), (2, 4, 8));
+
+        // A single measurement is printed as a plain figure.
+        assert_eq!(Spread::of(vec![7]).describe(), "7");
+    }
+
+    #[test]
+    fn repeat_outside_one_to_sixteen_is_rejected_before_loading_the_contract() {
+        for repeat in [0, MAX_REPEATS + 1] {
+            let args = LimitsArgs {
+                contract: "missing.wasm".into(),
+                function: "run".into(),
+                ramp: "amount".into(),
+                jobs: 1,
+                probe_timeout: 120,
+                repeat,
+                dry_run: false,
+                bool_defaults: Vec::new(),
+                auth_mode: AuthMode::All,
+                json: false,
+            };
+            let out = crate::commands::output::Output {
+                verbosity: crate::commands::output::Verbosity::Quiet,
+                color: false,
+            };
+            let err = run(args, out).unwrap_err();
+            assert_eq!(
+                err.0,
+                format!("--repeat must be between 1 and 16 (got {repeat})")
+            );
+        }
     }
 }
 
