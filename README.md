@@ -225,8 +225,10 @@ security guarantee. This is the same bounded claim made by the command output
 and the Module 9 requirements in [`BUILD_SPEC.md`](BUILD_SPEC.md#soroban-testkit-audit).
 See [Audit command limitations](#audit-command).
 
-`limits` ramps a numeric parameter directly, or generates addresses for a
-`Vec<Address>` parameter — the common "how many recipients" question.
+`limits` ramps a numeric parameter directly, or a `Vec<T>` parameter by its
+item count — the common "how many recipients" question. A `Vec` holds
+Address, bool, integer, Symbol, String or Bytes items; `Vec<Address>` items are
+distinct generated addresses, and a `Vec` ramp stops at 1,024 items.
 Every ramp attempt runs in its own subprocess: a real `.wasm` contract
 that exceeds resource limits can abort the process outright rather than
 return an error, and isolating each attempt is the only safe way to probe
@@ -241,7 +243,13 @@ JSON results keep `schema_version: 1` and their existing fields. An additive
 `search_ceiling`, `first_failing`, and `failure_outcome`
 (`contract_rejected` or `host_aborted` when measured). If all probes
 succeed through 16,777,216, this is a cap, **not** a measured maximum.
+A `Vec` ramp's cap is 1,024 items, and the same rule applies there.
 The text report also says explicitly when the search was capped.
+
+`--repeat N` (1 to 16, default 1) measures the final value N times, each in a
+fresh environment, and reports the median with the min and max for each field.
+The JSON `measurements` object carries the same spread. Use it when a contract
+or the host may vary between runs; a single measurement is one sample.
 
 Example:
 
@@ -259,7 +267,7 @@ A run prints the last successful ramp value and exactly two measured
 fields, both from the local SDK budget:
 
 ```text
-last successful recipients for "batch_payout": 37
+last successful recipients for "batch_payout": 37 generated items
   instructions: 98213456
   memory bytes: 4718592
   (ledger reads/writes and transaction size are not measured by this command; see --help)

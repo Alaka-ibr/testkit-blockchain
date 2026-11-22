@@ -5,7 +5,7 @@ use super::*;
 fn bounds_distinguish_cap_from_a_measured_failure() {
     assert_eq!(boundary_kind(None), "search_cap_reached");
     assert_eq!(boundary_kind(Some(8)), "measured_failure");
-    let result = find_ladder_bounds(4, |values: &[u32]| {
+    let result = find_ladder_bounds(4, SEARCH_CEILING, |values: &[u32]| {
         Ok(Some(values.iter().map(|_| true).collect()))
     })
     .unwrap();
@@ -20,11 +20,26 @@ fn json_reports_the_boundary_without_removing_legacy_fields() {
         ramp: "amount".into(),
         jobs: 1,
         probe_timeout: 120,
+        repeat: 1,
         dry_run: false,
+        bool_defaults: Vec::new(),
+        auth_mode: AuthMode::All,
         json: true,
     };
-    let capped: serde_json::Value =
-        serde_json::from_str(&render_json(&args, 7, 100, 200, None, None)).unwrap();
+    let cost = Measured {
+        instructions: Spread::of(vec![100]),
+        memory_bytes: Spread::of(vec![200]),
+    };
+    let capped: serde_json::Value = serde_json::from_str(&render_json(
+        &args,
+        7,
+        &cost,
+        None,
+        None,
+        SEARCH_CEILING,
+        None,
+    ))
+    .unwrap();
     assert_eq!(capped["schema_version"], 1);
     assert_eq!(capped["last_successful"], 7);
     assert_eq!(capped["boundary"]["kind"], "search_cap_reached");
@@ -34,15 +49,72 @@ fn json_reports_the_boundary_without_removing_legacy_fields() {
     let measured: serde_json::Value = serde_json::from_str(&render_json(
         &args,
         7,
-        100,
-        200,
+        &cost,
         Some(8),
         Some("contract_rejected"),
+        SEARCH_CEILING,
+        None,
     ))
     .unwrap();
     assert_eq!(measured["boundary"]["kind"], "measured_failure");
     assert_eq!(measured["boundary"]["first_failing"], 8);
     assert_eq!(measured["boundary"]["failure_outcome"], "contract_rejected");
+}
+
+#[test]
+fn json_reports_repeat_spread_and_generated_items_for_vec_ramps() {
+    let args = LimitsArgs {
+        contract: "fixture.wasm".into(),
+        function: "batch_payout".into(),
+        ramp: "recipients".into(),
+        jobs: 1,
+        probe_timeout: 120,
+        repeat: 3,
+        dry_run: false,
+        bool_defaults: Vec::new(),
+        auth_mode: AuthMode::All,
+        json: true,
+    };
+    let cost = Measured {
+        instructions: Spread::of(vec![30, 10, 20]),
+        memory_bytes: Spread::of(vec![5, 7, 6]),
+    };
+    let doc: serde_json::Value = serde_json::from_str(&render_json(
+        &args,
+        512,
+        &cost,
+        None,
+        None,
+        MAX_VEC_RAMP_ITEMS,
+        Some(512),
+    ))
+    .unwrap();
+    assert_eq!(doc["generated_items"], 512);
+    assert_eq!(doc["instructions"], 20, "top-level figure is the median");
+    assert_eq!(doc["memory_bytes"], 6);
+    assert_eq!(doc["measurements"]["repeats"], 3);
+    assert_eq!(doc["measurements"]["instructions"]["min"], 10);
+    assert_eq!(doc["measurements"]["instructions"]["max"], 30);
+    assert_eq!(doc["measurements"]["memory_bytes"]["median"], 6);
+    assert_eq!(doc["boundary"]["search_ceiling"], MAX_VEC_RAMP_ITEMS);
+
+    // An integer ramp has no item count.
+    let integer = LimitsArgs {
+        ramp: "amount".into(),
+        function: "run".into(),
+        ..args
+    };
+    let doc: serde_json::Value = serde_json::from_str(&render_json(
+        &integer,
+        7,
+        &cost,
+        None,
+        None,
+        SEARCH_CEILING,
+        None,
+    ))
+    .unwrap();
+    assert!(doc["generated_items"].is_null());
 }
 
 #[test]
@@ -53,7 +125,10 @@ fn zero_timeout_is_rejected_before_accessing_a_contract() {
         ramp: "amount".into(),
         jobs: 1,
         probe_timeout: 0,
+        repeat: 1,
         dry_run: false,
+        bool_defaults: Vec::new(),
+        auth_mode: AuthMode::All,
         json: false,
     };
     let output = super::super::output::Output {
@@ -83,7 +158,10 @@ fn fixture_args() -> LimitsArgs {
         ramp: "amount".into(),
         jobs: 1,
         probe_timeout: 120,
+        repeat: 1,
         dry_run: false,
+        bool_defaults: Vec::new(),
+        auth_mode: AuthMode::All,
         json: false,
     }
 }
