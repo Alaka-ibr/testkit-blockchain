@@ -182,9 +182,7 @@ fn subprocess_exit_classification_and_verbose_output() {
         (
             "setup",
             "echo invalid-setup >&2; exit 1",
-            ProbeExit::LaunchFailed(
-                "probe setup failed; inspect --verbose diagnostics".into(),
-            ),
+            ProbeExit::LaunchFailed("probe setup failed; inspect --verbose diagnostics".into()),
         ),
     ] {
         let executable = executable_script(temp.path(), name, shell);
