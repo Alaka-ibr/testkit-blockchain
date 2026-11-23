@@ -80,9 +80,9 @@ Options:
           Authorization mock scope: all (default), root-only, or none
 
           Possible values:
-          - all: Approve every authorization entry, including nested invocations
+          - all:       Approve every authorization entry, including nested invocations
           - root-only: Approve only authorization required by the root invocation
-          - none: Do not install authorization mocks
+          - none:      Do not install authorization mocks
           
           [default: all]
 
