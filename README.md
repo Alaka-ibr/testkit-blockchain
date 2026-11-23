@@ -345,14 +345,17 @@ semantics are outside the current SDK testutils boundary.
   body never calls `require_auth`.
 - `unchecked-i128-arithmetic`: `+`, `-`, `*`, or `/` on a value typed `i128`
   in the same function, instead of a `checked_`/`saturating_`/`wrapping_`
-  method.
+  method. The finding points at the operator's line, even in a multiline
+  expression.
 - `missing-ttl-bump`: a persistent or temporary storage `get` with no
   `extend_ttl` call in the same function body.
 
 It does not expand macros, follow calls into helper functions, or replace a
 contract security review, so both false positives and false negatives are
-expected. Every run that isn't `--quiet`, including one with no findings,
-ends with the same disclaimer: a missing finding is not a security guarantee.
+expected. Unreadable directories abort the audit with an error instead of
+being silently skipped, since skipping one could hide every finding in it.
+Every run that isn't `--quiet`, including one with no findings, ends with the
+same disclaimer: a missing finding is not a security guarantee.
 
 ## Roadmap
 

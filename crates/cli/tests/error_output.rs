@@ -73,6 +73,50 @@ fn audit_of_a_missing_path_fails_instead_of_reporting_no_findings() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn audit_of_an_unreadable_directory_fails_instead_of_skipping_it() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "testkit-audit-unreadable-{}-{stamp}",
+        std::process::id()
+    ));
+    let hidden = root.join("hidden");
+    std::fs::create_dir_all(&hidden).expect("create temp audit tree");
+    std::fs::write(hidden.join("lib.rs"), "fn ok() {}").expect("write temp source");
+    let original = std::fs::metadata(&hidden)
+        .expect("stat temp directory")
+        .permissions();
+    std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000))
+        .expect("remove temp directory read permission");
+
+    let inaccessible = std::fs::read_dir(&hidden).is_err();
+    let output =
+        inaccessible.then(|| run(&["audit", root.to_str().expect("temp path is valid UTF-8")]));
+
+    std::fs::set_permissions(&hidden, original).expect("restore temp directory permissions");
+    std::fs::remove_dir_all(&root).expect("remove temp audit tree");
+
+    let Some(output) = output else {
+        return;
+    };
+    let message = assert_cli_error(&output);
+    assert!(
+        message.starts_with(&format!("cannot audit `{}`", hidden.display())),
+        "{message}"
+    );
+    assert!(
+        message.contains("Permission denied") || message.contains("permission denied"),
+        "{message}"
+    );
+}
+
 #[test]
 fn audit_strict_findings_use_the_shared_format() {
     let output = run(&["audit", "examples/vault/src", "--strict"]);
