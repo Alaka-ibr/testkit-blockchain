@@ -349,6 +349,26 @@ semantics are outside the current SDK testutils boundary.
 - `missing-ttl-bump`: a persistent or temporary storage `get` with no
   `extend_ttl` call in the same function body.
 
+Each function is checked against its own body only. A `fn` (or `impl`)
+declared inside another function is audited once, as its own function, so a
+nested helper's `require_auth` does not count for its parent and its storage
+reads are not reported twice. `unchecked-i128-arithmetic` reports one finding
+per arithmetic expression, at that expression's line: `a + b + c` is one
+finding, while arithmetic in a separate expression inside it (such as a call
+argument) gets its own.
+
+Run a subset of rules with `--rule` (repeatable or comma-separated; every rule
+named runs, the rest are skipped) or skip some with `--exclude-rule`:
+
+```sh
+soroban-testkit audit ./src --rule missing-require-auth --rule missing-ttl-bump
+soroban-testkit audit ./src --exclude-rule unchecked-i128-arithmetic --strict
+```
+
+An unknown rule name, a rule passed to both flags, or excluding every rule is
+a usage error (exit 2). `--strict` counts only findings from the rules that
+ran, and `--json` lists them in a `rules` field.
+
 It does not expand macros, follow calls into helper functions, or replace a
 contract security review, so both false positives and false negatives are
 expected. Every run that isn't `--quiet`, including one with no findings,

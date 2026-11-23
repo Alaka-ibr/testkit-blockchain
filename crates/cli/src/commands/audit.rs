@@ -2,10 +2,9 @@ use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use clap::Args;
-use quote::ToTokens;
+use clap::{Args, ValueEnum};
 use syn::visit::{self, Visit};
-use syn::{BinOp, Expr, FnArg, ImplItemFn, ItemFn, Local, Pat, Signature, Type};
+use syn::{BinOp, Expr, FnArg, ImplItemFn, Item, ItemFn, Local, Pat, Signature, Type};
 use walkdir::WalkDir;
 
 use super::output::Output;
@@ -16,6 +15,8 @@ use super::CliError;
 #[command(after_help = "EXAMPLES:\n    \
     soroban-testkit audit ./src\n    \
     soroban-testkit audit ./src --strict\n    \
+    soroban-testkit audit ./src --rule missing-require-auth --rule missing-ttl-bump\n    \
+    soroban-testkit audit ./src --exclude-rule unchecked-i128-arithmetic\n    \
     soroban-testkit audit ./src --json | jq '.findings'")]
 pub struct AuditArgs {
     /// Directory or .rs file to audit; directories are scanned recursively
@@ -31,6 +32,101 @@ pub struct AuditArgs {
     /// instead of text
     #[arg(long, verbatim_doc_comment)]
     json: bool,
+    /// Run only this rule (repeatable, or comma-separated). Every rule
+    /// named is run; rules not named are skipped. Without --rule, all
+    /// rules run
+    #[arg(
+        long = "rule",
+        value_name = "RULE",
+        value_enum,
+        value_delimiter = ',',
+        verbatim_doc_comment
+    )]
+    rules: Vec<Rule>,
+    /// Skip this rule (repeatable, or comma-separated). Applied after
+    /// --rule; naming a rule in both is an error
+    #[arg(
+        long = "exclude-rule",
+        value_name = "RULE",
+        value_enum,
+        value_delimiter = ',',
+        verbatim_doc_comment
+    )]
+    exclude_rules: Vec<Rule>,
+}
+
+/// The audit rules, by the ID each finding reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, ValueEnum)]
+pub enum Rule {
+    /// An Address parameter that is never checked with require_auth
+    MissingRequireAuth,
+    /// Raw `+ - * /` on an i128 value
+    UncheckedI128Arithmetic,
+    /// A persistent/temporary storage read with no extend_ttl
+    MissingTtlBump,
+}
+
+impl Rule {
+    const ALL: [Rule; 3] = [
+        Rule::MissingRequireAuth,
+        Rule::UncheckedI128Arithmetic,
+        Rule::MissingTtlBump,
+    ];
+
+    /// The rule ID used in findings and accepted by --rule/--exclude-rule.
+    pub fn id(self) -> &'static str {
+        match self {
+            Rule::MissingRequireAuth => "missing-require-auth",
+            Rule::UncheckedI128Arithmetic => "unchecked-i128-arithmetic",
+            Rule::MissingTtlBump => "missing-ttl-bump",
+        }
+    }
+}
+
+/// Resolves `--rule` and `--exclude-rule` into the rules to run, in the
+/// fixed order of [`Rule::ALL`]. Selecting rules never hides findings of
+/// another selected rule: every rule in the result is fully evaluated, and
+/// the filter only decides which rules run, not which findings are kept.
+///
+/// Contradictory flags are usage errors, so the message is returned for
+/// [`usage_error`] to report like any other clap argument error (exit 2).
+fn selected_rules(include: &[Rule], exclude: &[Rule]) -> Result<Vec<Rule>, String> {
+    if let Some(rule) = include.iter().find(|rule| exclude.contains(rule)) {
+        return Err(format!(
+            "rule `{}` is both selected with --rule and skipped with --exclude-rule; \
+             pass it to only one of them",
+            rule.id()
+        ));
+    }
+    let rules: Vec<Rule> = Rule::ALL
+        .into_iter()
+        .filter(|rule| include.is_empty() || include.contains(rule))
+        .filter(|rule| !exclude.contains(rule))
+        .collect();
+    if rules.is_empty() {
+        return Err(
+            "--exclude-rule skips every rule, so there is nothing to audit; \
+                    leave at least one rule enabled"
+                .to_string(),
+        );
+    }
+    Ok(rules)
+}
+
+/// Exits with clap's usage-error format and status 2, as for an unknown
+/// flag, honouring --no-color / NO_COLOR like the rest of the CLI.
+fn usage_error(message: String) -> ! {
+    use clap::CommandFactory;
+    let mut command = super::Cli::command();
+    if super::output::no_color_requested(std::env::args_os()) {
+        command = command.color(clap::ColorChoice::Never);
+    }
+    command.build();
+    command
+        .find_subcommand_mut("audit")
+        .expect("audit is a subcommand")
+        .error(clap::error::ErrorKind::ArgumentConflict, message)
+        .exit()
 }
 
 /// Version of the `audit --json` document shape. Bump it on any breaking
@@ -68,6 +164,9 @@ struct Finding {
 /// [`finding_path`]), so the same crate reports the same paths whichever
 /// directory the command runs from.
 pub fn run(args: AuditArgs, out: Output) -> Result<(), CliError> {
+    let rules =
+        selected_rules(&args.rules, &args.exclude_rules).unwrap_or_else(|msg| usage_error(msg));
+    let all_rules = rules.len() == Rule::ALL.len();
     let mut findings = Vec::new();
 
     if args.path == Path::new("-") {
@@ -75,7 +174,7 @@ pub fn run(args: AuditArgs, out: Output) -> Result<(), CliError> {
         std::io::stdin()
             .read_to_string(&mut src)
             .map_err(|err| CliError(format!("failed to read stdin: {err}")))?;
-        audit_source(&src, "<stdin>", &mut findings);
+        audit_source(&src, "<stdin>", &rules, &mut findings);
     } else {
         // WalkDir yields a missing root as an Err entry, which the
         // filter_map below would drop, so a typo'd PATH would otherwise
@@ -87,9 +186,7 @@ pub fn run(args: AuditArgs, out: Output) -> Result<(), CliError> {
                 super::quote(args.path.display())
             ))
         })?;
-        for entry in WalkDir::new(&args.path)
-            .into_iter()
-            .filter_map(Result::ok) {
+        for entry in WalkDir::new(&args.path).into_iter().filter_map(Result::ok) {
             // Skip symlinks: audit only follows the real filesystem structure for
             // deterministic results (symlinks can create cycles, loops, or
             // inaccessible paths depending on the platform and permissions).
@@ -106,13 +203,21 @@ pub fn run(args: AuditArgs, out: Output) -> Result<(), CliError> {
             audit_file(
                 entry.path(),
                 &finding_path(&args.path, entry.path()),
+                &rules,
                 &mut findings,
             )?;
         }
     }
 
+    // Text mode only: stdout must stay a single JSON document with --json,
+    // which reports the rules that ran in its `rules` field instead.
+    if !all_rules && !args.json {
+        let ids: Vec<&str> = rules.iter().map(|rule| rule.id()).collect();
+        out.note(format!("audit: running only {}", ids.join(", ")));
+    }
+
     if args.json {
-        println!("{}", render_json(&findings));
+        println!("{}", render_json(&findings, &rules));
     } else if findings.is_empty() {
         out.note(format!("audit: no findings. {DISCLAIMER}"));
     } else {
@@ -138,9 +243,12 @@ pub fn run(args: AuditArgs, out: Output) -> Result<(), CliError> {
 /// [`AUDIT_JSON_SCHEMA_VERSION`]:
 ///
 /// ```json
-/// {"schema_version":1,"disclaimer":"...","finding_count":1,"findings":[{"file":"src/lib.rs","line":7,"severity":"warning","rule":"missing-require-auth","message":"..."}]}
+/// {"schema_version":1,"disclaimer":"...","rules":["missing-require-auth","unchecked-i128-arithmetic","missing-ttl-bump"],"finding_count":1,"findings":[{"file":"src/lib.rs","line":7,"severity":"warning","rule":"missing-require-auth","message":"..."}]}
 /// ```
-fn render_json(findings: &[Finding]) -> String {
+///
+/// `rules` lists the rules that ran (see `--rule`/`--exclude-rule`); it was
+/// added without a version bump because new fields are not breaking.
+fn render_json(findings: &[Finding], rules: &[Rule]) -> String {
     let items: Vec<String> = findings
         .iter()
         .map(|finding| {
@@ -154,9 +262,11 @@ fn render_json(findings: &[Finding]) -> String {
             )
         })
         .collect();
+    let rule_ids: Vec<String> = rules.iter().map(|rule| json_string(rule.id())).collect();
     format!(
-        "{{\"schema_version\":{AUDIT_JSON_SCHEMA_VERSION},\"disclaimer\":{},\"finding_count\":{},\"findings\":[{}]}}",
+        "{{\"schema_version\":{AUDIT_JSON_SCHEMA_VERSION},\"disclaimer\":{},\"rules\":[{}],\"finding_count\":{},\"findings\":[{}]}}",
         json_string(DISCLAIMER),
+        rule_ids.join(","),
         findings.len(),
         items.join(",")
     )
@@ -200,14 +310,19 @@ fn finding_path(root: &Path, file: &Path) -> String {
         .join("/")
 }
 
-fn audit_file(path: &Path, display: &str, findings: &mut Vec<Finding>) -> Result<(), CliError> {
+fn audit_file(
+    path: &Path,
+    display: &str,
+    rules: &[Rule],
+    findings: &mut Vec<Finding>,
+) -> Result<(), CliError> {
     let src = std::fs::read_to_string(path).map_err(|err| {
         CliError(format!(
             "failed to read {}: {err}",
             super::quote(path.display())
         ))
     })?;
-    audit_source(&src, display, findings);
+    audit_source(&src, display, rules, findings);
     Ok(())
 }
 
@@ -215,8 +330,13 @@ fn audit_file(path: &Path, display: &str, findings: &mut Vec<Finding>) -> Result
 /// `display` in findings) and walks it for audit findings. An empty or
 /// unparseable source produces zero findings rather than an error —
 /// not every `.rs` file under a crate root need parse standalone, and
-/// a stdin editor buffer may be mid-edit.
-fn audit_source(src: &str, display: &str, findings: &mut Vec<Finding>) {
+/// a stdin editor buffer may be mid-edit. Only `rules` are evaluated.
+///
+/// Each function is audited once, against its own body: nested items (a
+/// `fn` or `impl` declared inside a function body) are skipped by every
+/// rule's walk and audited separately as functions of their own, so one
+/// source expression is never reported twice.
+fn audit_source(src: &str, display: &str, rules: &[Rule], findings: &mut Vec<Finding>) {
     let file = match syn::parse_file(src) {
         Ok(file) => file,
         Err(_) => return,
@@ -224,6 +344,7 @@ fn audit_source(src: &str, display: &str, findings: &mut Vec<Finding>) {
 
     let mut visitor = FunctionVisitor {
         path: display.to_string(),
+        rules,
         findings,
     };
     visitor.visit_file(&file);
@@ -231,6 +352,7 @@ fn audit_source(src: &str, display: &str, findings: &mut Vec<Finding>) {
 
 struct FunctionVisitor<'a> {
     path: String,
+    rules: &'a [Rule],
     findings: &'a mut Vec<Finding>,
 }
 
@@ -238,25 +360,30 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
         let line = line_of(node);
         self.audit_function(&node.sig, &node.block, line);
-        self.audit_i128_arithmetic(&node.sig, &node.block, line);
+        self.audit_i128_arithmetic(&node.sig, &node.block);
+        // Continues into nested items, which are audited as their own functions
         visit::visit_item_fn(self, node);
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
         let line = line_of(node);
         self.audit_function(&node.sig, &node.block, line);
-        self.audit_i128_arithmetic(&node.sig, &node.block, line);
+        self.audit_i128_arithmetic(&node.sig, &node.block);
         visit::visit_impl_item_fn(self, node);
     }
 }
 
 impl FunctionVisitor<'_> {
+    fn runs(&self, rule: Rule) -> bool {
+        self.rules.contains(&rule)
+    }
+
     fn audit_function(&mut self, sig: &Signature, body: &syn::Block, line: usize) {
         let name = sig.ident.to_string();
 
         // Rule 1: an Address parameter that's never checked with require_auth.
         let address_params = address_typed_params(sig);
-        if !address_params.is_empty() {
+        if self.runs(Rule::MissingRequireAuth) && !address_params.is_empty() {
             let mut auth_visitor = RequireAuthVisitor {
                 has_require_auth: false,
             };
@@ -264,7 +391,7 @@ impl FunctionVisitor<'_> {
             if !auth_visitor.has_require_auth {
                 self.push(
                     line,
-                    "missing-require-auth",
+                    Rule::MissingRequireAuth.id(),
                     "warning",
                     format!(
                         "fn {name} takes Address parameter(s) {address_params:?} but never calls \
@@ -275,6 +402,9 @@ impl FunctionVisitor<'_> {
         }
 
         // Rule 3: a storage read with no extend_ttl anywhere in the function.
+        if !self.runs(Rule::MissingTtlBump) {
+            return;
+        }
         let mut storage_visitor = StorageAccessVisitor {
             storage_type: None,
             has_extend_ttl: false,
@@ -285,7 +415,7 @@ impl FunctionVisitor<'_> {
             if !storage_visitor.has_extend_ttl {
                 self.push(
                     line,
-                    "missing-ttl-bump",
+                    Rule::MissingTtlBump.id(),
                     "warning",
                     format!(
                         "fn {name} reads from {} storage but never calls extend_ttl in its body",
@@ -306,7 +436,10 @@ impl FunctionVisitor<'_> {
         });
     }
 
-    fn audit_i128_arithmetic(&mut self, sig: &Signature, body: &syn::Block, line: usize) {
+    fn audit_i128_arithmetic(&mut self, sig: &Signature, body: &syn::Block) {
+        if !self.runs(Rule::UncheckedI128Arithmetic) {
+            return;
+        }
         let mut i128_bindings: HashSet<String> = HashSet::new();
         for arg in &sig.inputs {
             if let FnArg::Typed(pat_type) = arg {
@@ -321,7 +454,6 @@ impl FunctionVisitor<'_> {
         let mut visitor = I128ArithmeticVisitor {
             path: self.path.clone(),
             fn_name: sig.ident.to_string(),
-            fn_line: line,
             i128_bindings,
             findings: self.findings,
         };
@@ -366,15 +498,22 @@ fn line_of(node: impl quote::ToTokens) -> usize {
 /// "arithmetic on an i128" needs to know which bindings are actually
 /// typed `i128`, and a plain string search over the token stream can't
 /// tell an `i128` value from the substring appearing anywhere else.
+///
+/// A finding is reported once per arithmetic *expression*, at that
+/// expression's line: `a + b + c` parses as `(a + b) + c`, but it is one
+/// source expression and produces one finding. Arithmetic in a separate
+/// expression nested inside it (e.g. a call argument) is reported on its own.
 struct I128ArithmeticVisitor<'a> {
     path: String,
     fn_name: String,
-    fn_line: usize,
     i128_bindings: HashSet<String>,
     findings: &'a mut Vec<Finding>,
 }
 
 impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
+    // Nested functions are audited separately with their own bindings
+    fn visit_item(&mut self, _node: &'ast Item) {}
+
     fn visit_local(&mut self, node: &'ast Local) {
         if let Pat::Type(pat_type) = &node.pat {
             if type_is_i128(&pat_type.ty) {
@@ -387,15 +526,15 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
     }
 
     fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
-        let is_arith = matches!(
-            node.op,
-            BinOp::Add(_) | BinOp::Sub(_) | BinOp::Mul(_) | BinOp::Div(_)
-        );
-        if is_arith && (self.touches_i128(&node.left) || self.touches_i128(&node.right)) {
+        if !is_arithmetic(&node.op) {
+            return visit::visit_expr_binary(self, node);
+        }
+        let whole = Expr::Binary(node.clone());
+        if self.arithmetic_touches_i128(&whole) {
             self.findings.push(Finding {
                 file: self.path.clone(),
-                line: self.fn_line,
-                rule: "unchecked-i128-arithmetic",
+                line: line_of(node),
+                rule: Rule::UncheckedI128Arithmetic.id(),
                 severity: "warning",
                 message: format!(
                     "fn {} does raw arithmetic on an i128 value; prefer checked_/saturating_/ \
@@ -404,11 +543,49 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
                 ),
             });
         }
-        visit::visit_expr_binary(self, node);
+        // The arithmetic operators of this expression are covered by the
+        // check above; only its non-arithmetic operands may hold separate
+        // expressions (calls, blocks, closures) that need their own check.
+        self.visit_arithmetic_operands(&whole);
     }
 }
 
+fn is_arithmetic(op: &BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Add(_) | BinOp::Sub(_) | BinOp::Mul(_) | BinOp::Div(_)
+    )
+}
+
 impl I128ArithmeticVisitor<'_> {
+    /// Whether any operand anywhere in this arithmetic expression (looking
+    /// through nested `+ - * /` and parentheses) is an i128 value.
+    fn arithmetic_touches_i128(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Binary(binary) if is_arithmetic(&binary.op) => {
+                self.arithmetic_touches_i128(&binary.left)
+                    || self.arithmetic_touches_i128(&binary.right)
+            }
+            Expr::Paren(p) => self.arithmetic_touches_i128(&p.expr),
+            Expr::Group(g) => self.arithmetic_touches_i128(&g.expr),
+            other => self.touches_i128(other),
+        }
+    }
+
+    /// Visits the leaf operands of an arithmetic expression, skipping the
+    /// arithmetic nodes that belong to the same source expression.
+    fn visit_arithmetic_operands(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Binary(binary) if is_arithmetic(&binary.op) => {
+                self.visit_arithmetic_operands(&binary.left);
+                self.visit_arithmetic_operands(&binary.right);
+            }
+            Expr::Paren(p) => self.visit_arithmetic_operands(&p.expr),
+            Expr::Group(g) => self.visit_arithmetic_operands(&g.expr),
+            other => self.visit_expr(other),
+        }
+    }
+
     fn touches_i128(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Path(p) => p
@@ -435,6 +612,9 @@ struct RequireAuthVisitor {
 }
 
 impl<'ast> Visit<'ast> for RequireAuthVisitor {
+    // A nested function's require_auth does not authorize the outer function
+    fn visit_item(&mut self, _node: &'ast Item) {}
+
     fn visit_expr(&mut self, node: &'ast Expr) {
         if let Expr::MethodCall(mc) = node {
             if mc.method == "require_auth" {
@@ -454,6 +634,9 @@ struct StorageAccessVisitor {
 }
 
 impl<'ast> Visit<'ast> for StorageAccessVisitor {
+    // A nested function's storage access is reported for that function only
+    fn visit_item(&mut self, _node: &'ast Item) {}
+
     fn visit_expr(&mut self, node: &'ast Expr) {
         if let Expr::MethodCall(mc) = node {
             if mc.method == "extend_ttl" {
@@ -494,7 +677,7 @@ mod tests {
             severity: "warning",
             message: "fn pay takes Address parameter(s) [\"from\"]".to_string(),
         }];
-        let json = render_json(&findings);
+        let json = render_json(&findings, &Rule::ALL);
         assert!(json.starts_with("{\"schema_version\":1,"), "{json}");
         assert!(json.contains("\"finding_count\":1"), "{json}");
         assert!(json.contains("\"line\":7"), "{json}");
@@ -504,7 +687,7 @@ mod tests {
 
     #[test]
     fn json_document_for_no_findings_is_an_empty_list() {
-        let json = render_json(&[]);
+        let json = render_json(&[], &Rule::ALL);
         assert!(
             json.ends_with(",\"finding_count\":0,\"findings\":[]}"),
             "{json}"
@@ -568,7 +751,7 @@ mod tests {
         }
         "#;
         let mut findings = Vec::new();
-        audit_source(src, "test.rs", &mut findings);
+        audit_source(src, "test.rs", &Rule::ALL, &mut findings);
         // The line number should correspond to the first line of the function definition
         // (line 2 in this case, since line 1 is blank)
         if let Some(finding) = findings.first() {
@@ -589,7 +772,7 @@ mod tests {
         }
         "#;
         let mut findings = Vec::new();
-        audit_source(src, "test.rs", &mut findings);
+        audit_source(src, "test.rs", &Rule::ALL, &mut findings);
         if let Some(finding) = findings.first() {
             // Should still report the missing-require-auth at the function definition line,
             // not at a line in the comment
@@ -613,7 +796,7 @@ mod tests {
         }
         "#;
         let mut findings = Vec::new();
-        audit_source(src, "test.rs", &mut findings);
+        audit_source(src, "test.rs", &Rule::ALL, &mut findings);
         // Should NOT report missing-require-auth because require_auth is called
         let missing_auth = findings.iter().any(|f| f.rule == "missing-require-auth");
         assert!(
@@ -635,7 +818,7 @@ mod tests {
         }
         "#;
         let mut findings = Vec::new();
-        audit_source(src, "test.rs", &mut findings);
+        audit_source(src, "test.rs", &Rule::ALL, &mut findings);
         // Should report missing-ttl-bump because there's no extend_ttl call
         let missing_ttl = findings.iter().any(|f| f.rule == "missing-ttl-bump");
         assert!(
@@ -653,12 +836,132 @@ mod tests {
         }
         "#;
         let mut findings = Vec::new();
-        audit_source(src, "test.rs", &mut findings);
+        audit_source(src, "test.rs", &Rule::ALL, &mut findings);
         // Should NOT report missing-ttl-bump
         let missing_ttl = findings.iter().any(|f| f.rule == "missing-ttl-bump");
         assert!(
             !missing_ttl,
             "extend_ttl should be detected despite formatting variations"
         );
+    }
+
+    fn rules_of(src: &str, rules: &[Rule]) -> Vec<(&'static str, usize)> {
+        let mut findings = Vec::new();
+        audit_source(src, "test.rs", rules, &mut findings);
+        findings.iter().map(|f| (f.rule, f.line)).collect()
+    }
+
+    #[test]
+    fn chained_i128_arithmetic_is_one_finding_at_its_line() {
+        let src = "fn f(a: i128, b: i128, c: i128) -> i128 {\n    let x = 1;\n    (a + b) * c - a / b\n}\n";
+        assert_eq!(
+            rules_of(src, &Rule::ALL),
+            vec![("unchecked-i128-arithmetic", 3)]
+        );
+    }
+
+    #[test]
+    fn arithmetic_inside_a_call_argument_is_a_separate_expression() {
+        let src = "fn f(a: i128, b: i128) -> i128 {\n    a + g(\n        b * 2i128,\n    )\n}\n";
+        assert_eq!(
+            rules_of(src, &Rule::ALL),
+            vec![
+                ("unchecked-i128-arithmetic", 2),
+                ("unchecked-i128-arithmetic", 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_i128_arithmetic_still_reaches_nested_i128_expressions() {
+        let src = "fn f(n: u32, a: i128) -> u32 {\n    n + h(\n        a - 1i128,\n    )\n}\n";
+        assert_eq!(
+            rules_of(src, &Rule::ALL),
+            vec![("unchecked-i128-arithmetic", 3)]
+        );
+    }
+
+    #[test]
+    fn nested_functions_are_audited_once_as_themselves() {
+        let src = r#"
+fn outer(env: Env, owner: Address) {
+    fn inner(env: Env, owner: Address, a: i128) -> i128 {
+        owner.require_auth();
+        let v = env.storage().temporary().get(&k);
+        a * 2i128
+    }
+    impl Helper {
+        fn method(env: Env) {
+            let v = env.storage().persistent().get(&k);
+        }
+    }
+}
+"#;
+        let mut found = rules_of(src, &Rule::ALL);
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                // outer: inner's require_auth does not authorize outer
+                ("missing-require-auth", 2),
+                // inner: its own storage read and arithmetic, once each
+                ("missing-ttl-bump", 3),
+                // method in the nested impl block
+                ("missing-ttl-bump", 9),
+                ("unchecked-i128-arithmetic", 6),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_selected_rules_run() {
+        let src = "fn f(env: Env, who: Address, a: i128) -> i128 {\n    let v = env.storage().persistent().get(&k);\n    a + 1i128\n}\n";
+        assert_eq!(rules_of(src, &Rule::ALL).len(), 3);
+        assert_eq!(
+            rules_of(src, &[Rule::MissingRequireAuth, Rule::MissingTtlBump]),
+            vec![("missing-require-auth", 1), ("missing-ttl-bump", 1)]
+        );
+        assert_eq!(
+            rules_of(src, &[Rule::UncheckedI128Arithmetic]),
+            vec![("unchecked-i128-arithmetic", 3)]
+        );
+    }
+
+    #[test]
+    fn rule_selection_resolves_include_then_exclude_in_a_fixed_order() {
+        use Rule::*;
+        assert_eq!(selected_rules(&[], &[]).unwrap(), Rule::ALL.to_vec());
+        assert_eq!(
+            selected_rules(&[MissingTtlBump, MissingRequireAuth], &[]).unwrap(),
+            vec![MissingRequireAuth, MissingTtlBump]
+        );
+        assert_eq!(
+            selected_rules(&[], &[UncheckedI128Arithmetic]).unwrap(),
+            vec![MissingRequireAuth, MissingTtlBump]
+        );
+        assert_eq!(
+            selected_rules(&[MissingTtlBump, MissingTtlBump], &[]).unwrap(),
+            vec![MissingTtlBump]
+        );
+        assert!(selected_rules(&[MissingTtlBump], &[MissingTtlBump])
+            .unwrap_err()
+            .contains("`missing-ttl-bump` is both selected"));
+        assert!(selected_rules(&[], &Rule::ALL)
+            .unwrap_err()
+            .contains("nothing to audit"));
+    }
+
+    #[test]
+    fn rule_ids_match_the_cli_value_names() {
+        for rule in Rule::ALL {
+            let value = rule.to_possible_value().unwrap();
+            assert_eq!(value.get_name(), rule.id());
+        }
+    }
+
+    #[test]
+    fn json_lists_the_rules_that_ran() {
+        let json = render_json(&[], &[Rule::MissingTtlBump]);
+        assert!(json.contains("\"rules\":[\"missing-ttl-bump\"],"), "{json}");
     }
 }

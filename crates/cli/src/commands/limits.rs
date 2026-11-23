@@ -431,7 +431,7 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
     let func = Symbol::new(&env, &args.function);
     let revalidation_args = build_args(&env, &func_spec, ramp_index, &bool_defaults, best)?;
     if !invoke_succeeds(&env, &contract_id, &func, revalidation_args) {
-        out.note(&format!(
+        out.note(format!(
             "warning: boundary revalidation failed for {} = {best}; this may indicate \
              nondeterministic contract behavior. consider running limits again.",
             args.ramp
@@ -734,13 +734,11 @@ fn run_probe_process(
     for default in &args.bool_defaults {
         command.arg("--bool-default").arg(default);
     }
-    command
-        .stdout(Stdio::null())
-        .stderr(if verbose {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        });
+    command.stdout(Stdio::null()).stderr(if verbose {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -800,7 +798,10 @@ fn run_probe_process(
     let diagnostic = reader
         .and_then(|reader| reader.join().ok())
         .filter(|message| !message.trim().is_empty());
-    ProbeResult { outcome, diagnostic }
+    ProbeResult {
+        outcome,
+        diagnostic,
+    }
 }
 
 /// Execute up to eight independent probes, retaining input ordering.
@@ -818,9 +819,7 @@ fn probe_concurrently(
             .into_iter()
             .map(|worker| {
                 worker.join().map_err(|_| {
-                    CliError(
-                        "an isolated probe worker panicked; re-run with --jobs 1".to_string(),
-                    )
+                    CliError("an isolated probe worker panicked; re-run with --jobs 1".to_string())
                 })
             })
             .collect()
@@ -1225,7 +1224,6 @@ fn ramp_index_of(
         })
 }
 
-
 /// Parses repeatable `--bool-default PARAM=BOOL` values.
 fn parse_bool_defaults(values: &[String]) -> Result<BTreeMap<String, bool>, CliError> {
     let mut defaults = BTreeMap::new();
@@ -1307,7 +1305,9 @@ fn build_args(
                 &admin,
                 &input.type_,
                 input,
-                bool_defaults.get(&input.name.to_utf8_string_lossy()).copied(),
+                bool_defaults
+                    .get(&input.name.to_utf8_string_lossy())
+                    .copied(),
             )?
         };
         vals.push_back(val);
@@ -1919,14 +1919,10 @@ mod tests {
         }
     }
 
-
     #[test]
     fn bool_defaults_parse_true_and_false_and_reject_invalid_values() {
-        let parsed = parse_bool_defaults(&[
-            "enabled=true".to_string(),
-            "paused=false".to_string(),
-        ])
-        .unwrap();
+        let parsed =
+            parse_bool_defaults(&["enabled=true".to_string(), "paused=false".to_string()]).unwrap();
         assert_eq!(parsed.get("enabled"), Some(&true));
         assert_eq!(parsed.get("paused"), Some(&false));
 
@@ -1962,25 +1958,21 @@ mod tests {
                 input("amount", ScSpecTypeDef::U32),
             ],
         );
-        assert!(validate_bool_defaults(
-            &func,
-            &BTreeMap::from([("enabled".to_string(), true)])
-        )
-        .is_ok());
-        assert!(validate_bool_defaults(
-            &func,
-            &BTreeMap::from([("missing".to_string(), true)])
-        )
-        .unwrap_err()
-        .0
-        .contains("unknown parameter"));
-        assert!(validate_bool_defaults(
-            &func,
-            &BTreeMap::from([("amount".to_string(), true)])
-        )
-        .unwrap_err()
-        .0
-        .contains("cannot be applied"));
+        assert!(
+            validate_bool_defaults(&func, &BTreeMap::from([("enabled".to_string(), true)])).is_ok()
+        );
+        assert!(
+            validate_bool_defaults(&func, &BTreeMap::from([("missing".to_string(), true)]))
+                .unwrap_err()
+                .0
+                .contains("unknown parameter")
+        );
+        assert!(
+            validate_bool_defaults(&func, &BTreeMap::from([("amount".to_string(), true)]))
+                .unwrap_err()
+                .0
+                .contains("cannot be applied")
+        );
     }
 
     #[test]
@@ -2300,4 +2292,3 @@ mod tests {
         }
     }
 }
-
