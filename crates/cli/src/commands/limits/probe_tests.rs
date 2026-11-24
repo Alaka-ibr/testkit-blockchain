@@ -150,6 +150,52 @@ fn executable_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
+/// Runs a probe against a script that was just written by `executable_script`,
+/// retrying only when the launch fails with `ETXTBSY` ("Text file busy").
+///
+/// Tests run on parallel threads. If another test forks a child while this
+/// script's file is still open for writing, the child briefly inherits that
+/// write descriptor and the kernel refuses to execute the script until it
+/// closes. The window is tiny, so a short retry is enough. Production probes
+/// always run the CLI's own, already-built binary and never see this race.
+#[cfg(unix)]
+fn run_script_probe(
+    executable: &Path,
+    scratch: &ProbeScratch,
+    args: &LimitsArgs,
+    value: u32,
+    timeout: Duration,
+    verbose: bool,
+) -> ProbeResult {
+    const ETXTBSY_RETRIES: usize = 50;
+    for _ in 0..ETXTBSY_RETRIES {
+        let result = run_probe_process(
+            executable,
+            scratch,
+            Path::new("fixture.wasm"),
+            args,
+            value,
+            timeout,
+            verbose,
+        );
+        match &result.outcome {
+            ProbeExit::LaunchFailed(message) if message.contains("os error 26") => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => return result,
+        }
+    }
+    run_probe_process(
+        executable,
+        scratch,
+        Path::new("fixture.wasm"),
+        args,
+        value,
+        timeout,
+        verbose,
+    )
+}
+
 #[cfg(unix)]
 fn fixture_args() -> LimitsArgs {
     LimitsArgs {
@@ -186,27 +232,12 @@ fn subprocess_exit_classification_and_verbose_output() {
         ),
     ] {
         let executable = executable_script(temp.path(), name, shell);
-        let verbose = run_probe_process(
-            &executable,
-            &temp,
-            Path::new("fixture.wasm"),
-            &args,
-            17,
-            Duration::from_secs(5),
-            true,
-        );
+        let verbose = run_script_probe(&executable, &temp, &args, 17, Duration::from_secs(5), true);
         assert_eq!(verbose.outcome, expected, "{name}");
         if name == "rejection" {
             assert!(verbose.diagnostic.unwrap().contains("contract-rejected"));
-            let quiet = run_probe_process(
-                &executable,
-                &temp,
-                Path::new("fixture.wasm"),
-                &args,
-                17,
-                Duration::from_secs(5),
-                false,
-            );
+            let quiet =
+                run_script_probe(&executable, &temp, &args, 17, Duration::from_secs(5), false);
             assert!(quiet.diagnostic.is_none());
         }
     }
@@ -228,10 +259,9 @@ fn hung_subprocess_times_out_and_is_reaped() {
     let temp = ProbeScratch::create().unwrap();
     let executable = executable_script(temp.path(), "hang", "while :; do :; done");
     let start = Instant::now();
-    let result = run_probe_process(
+    let result = run_script_probe(
         &executable,
         &temp,
-        Path::new("fixture.wasm"),
         &fixture_args(),
         19,
         Duration::from_millis(75),
@@ -250,10 +280,9 @@ fn verbose_diagnostics_are_bounded() {
         "noisy",
         "i=0; while [ \"$i\" -lt 3000 ]; do echo 'diagnostic line' >&2; i=$((i + 1)); done; exit 10",
     );
-    let result = run_probe_process(
+    let result = run_script_probe(
         &executable,
         &temp,
-        Path::new("fixture.wasm"),
         &fixture_args(),
         3,
         Duration::from_secs(5),

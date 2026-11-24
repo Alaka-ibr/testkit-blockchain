@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod fixtures {
     pub const AUDIT_WITH_FINDINGS: &str = "examples/vault/src";
     pub const AUDIT_CLEAN_FILE: &str = "crates/cli/src/commands/mod.rs";
+    pub const AUDIT_NESTED_FUNCTIONS: &str = "crates/cli/tests/fixtures/audit/nested_functions.rs";
     pub const VAULT_ROOT: &str = "examples/vault";
     pub const LIMITS_FUNCTION: &str = "batch_payout";
     pub const LIMITS_RAMP_PARAMETER: &str = "recipients";
@@ -584,4 +585,185 @@ fn coverage_without_cargo_on_path_reports_how_to_install_it() {
     );
     assert!(stderr.contains("cargo install cargo-llvm-cov"), "{stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
+/// `(line, rule)` for each finding in an `audit --json` document, in order.
+fn audit_json_findings(json: &str) -> Vec<(usize, String)> {
+    json.split("{\"file\":")
+        .skip(1)
+        .map(|finding| {
+            let field = |name: &str| {
+                let start = finding
+                    .find(&format!("\"{name}\":"))
+                    .unwrap_or_else(|| panic!("no {name} in {finding}"))
+                    + name.len()
+                    + 3;
+                finding[start..]
+                    .split([',', '}'])
+                    .next()
+                    .unwrap()
+                    .trim_matches('"')
+                    .to_string()
+            };
+            (field("line").parse().unwrap(), field("rule"))
+        })
+        .collect()
+}
+
+/// The 1-based line of the fixture line containing `needle`.
+fn fixture_line(path: &str, needle: &str) -> usize {
+    let src = std::fs::read_to_string(workspace_root().join(path)).unwrap();
+    src.lines()
+        .position(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("{needle:?} not in {path}"))
+        + 1
+}
+
+#[test]
+fn audit_reports_each_nested_function_and_expression_exactly_once() {
+    let fixture = fixtures::AUDIT_NESTED_FUNCTIONS;
+    let output = run_cli(&["audit", fixture, "--json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+
+    let line = |needle| fixture_line(fixture, needle);
+    let mut actual = audit_json_findings(&stdout);
+    actual.sort();
+    let mut expected = vec![
+        // `outer`: its nested helper's require_auth does not count for it
+        (line("pub fn outer("), "missing-require-auth".to_string()),
+        // `a + b + c` parses as `(a + b) + c` but is one expression
+        (line("a + b + c"), "unchecked-i128-arithmetic".to_string()),
+        // `helper`'s storage read and arithmetic, reported for `helper` only
+        (line("fn helper("), "missing-ttl-bump".to_string()),
+        (
+            line("stored * 2i128"),
+            "unchecked-i128-arithmetic".to_string(),
+        ),
+        // two separate expressions in `separate`
+        (
+            line("x + compute("),
+            "unchecked-i128-arithmetic".to_string(),
+        ),
+        (line("y - 1i128,"), "unchecked-i128-arithmetic".to_string()),
+    ];
+    expected.sort();
+    assert_eq!(actual, expected, "{stdout}");
+    assert!(stdout.contains("\"finding_count\":6,"), "{stdout}");
+}
+
+#[test]
+fn audit_rule_flag_runs_every_selected_rule_and_only_those() {
+    let all = run_cli(&["audit", fixtures::AUDIT_WITH_FINDINGS, "--json"]);
+    let all = audit_json_findings(&String::from_utf8_lossy(&all.stdout));
+    let count = |findings: &[(usize, String)], rule: &str| {
+        findings.iter().filter(|(_, r)| r == rule).count()
+    };
+    assert!(count(&all, "missing-require-auth") > 0);
+    assert!(count(&all, "missing-ttl-bump") > 0);
+    assert!(count(&all, "unchecked-i128-arithmetic") > 0);
+
+    // Repeated and comma-separated forms select the same two rules; selecting
+    // one rule never hides the findings of another selected rule.
+    for args in [
+        &[
+            "--rule",
+            "missing-require-auth",
+            "--rule",
+            "missing-ttl-bump",
+        ][..],
+        &["--rule", "missing-require-auth,missing-ttl-bump"][..],
+    ] {
+        let mut argv = vec!["audit", fixtures::AUDIT_WITH_FINDINGS, "--json"];
+        argv.extend_from_slice(args);
+        let output = run_cli(&argv);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{args:?}: {stdout}");
+        assert!(stdout.starts_with("{\"schema_version\":1,"), "{stdout}");
+        assert!(
+            stdout.contains("\"rules\":[\"missing-require-auth\",\"missing-ttl-bump\"]"),
+            "{stdout}"
+        );
+        let selected = audit_json_findings(&stdout);
+        assert_eq!(
+            count(&selected, "missing-require-auth"),
+            count(&all, "missing-require-auth")
+        );
+        assert_eq!(
+            count(&selected, "missing-ttl-bump"),
+            count(&all, "missing-ttl-bump")
+        );
+        assert_eq!(count(&selected, "unchecked-i128-arithmetic"), 0);
+    }
+}
+
+#[test]
+fn audit_exclude_rule_skips_only_the_named_rules() {
+    let output = run_cli(&[
+        "audit",
+        fixtures::AUDIT_WITH_FINDINGS,
+        "--exclude-rule",
+        "unchecked-i128-arithmetic",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stdout.contains("missing-require-auth"), "{stdout}");
+    assert!(stdout.contains("missing-ttl-bump"), "{stdout}");
+    assert!(!stdout.contains("unchecked-i128-arithmetic"), "{stdout}");
+    assert!(
+        stdout.contains("audit: running only missing-require-auth, missing-ttl-bump"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn audit_rule_selection_combines_with_strict() {
+    // --strict counts only the findings of the rules that ran.
+    // Excluding every rule leaves nothing to audit: a usage error, not a pass.
+    let nothing = run_cli(&[
+        "audit",
+        fixtures::AUDIT_NESTED_FUNCTIONS,
+        "--strict",
+        "--exclude-rule",
+        "missing-require-auth,unchecked-i128-arithmetic,missing-ttl-bump",
+    ]);
+    assert_eq!(
+        nothing.status.code(),
+        Some(2),
+        "excluding every rule is a usage error"
+    );
+
+    let strict = run_cli(&[
+        "audit",
+        fixtures::AUDIT_NESTED_FUNCTIONS,
+        "--strict",
+        "--rule",
+        "missing-ttl-bump",
+    ]);
+    let stderr = String::from_utf8_lossy(&strict.stderr);
+    assert_eq!(strict.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("1 audit finding(s) (--strict)"), "{stderr}");
+}
+
+#[test]
+fn audit_rule_selection_rejects_unknown_and_contradictory_rules_as_usage_errors() {
+    for args in [
+        &["--rule", "no-such-rule"][..],
+        &["--exclude-rule", "no-such-rule"][..],
+        &[
+            "--rule",
+            "missing-ttl-bump",
+            "--exclude-rule",
+            "missing-ttl-bump",
+        ][..],
+    ] {
+        let mut argv = vec!["audit", fixtures::AUDIT_WITH_FINDINGS];
+        argv.extend_from_slice(args);
+        let output = run_cli(&argv);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(stderr.starts_with("error:"), "{stderr}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
 }

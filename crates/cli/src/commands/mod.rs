@@ -63,11 +63,11 @@ pub enum Commands {
     ///   - Other parameters get these defaults: Address, a generated address
     ///     (a parameter named `token` gets a funded Stellar Asset Contract);
     ///     bool, false (or the value of --bool-default); u32, i32, u64, i64,
-    ///     u128 and i128, 1; Symbol, `x`; String and Bytes, empty; Vec<T>,
-    ///     empty; Option<T>, None.
+    ///     u128 and i128, 1; Symbol, `x`; String and Bytes, empty; `Vec<T>`,
+    ///     empty; `Option<T>`, None.
     ///   - Rejected with an error that names the type: Map, Tuple, Result,
     ///     BytesN, U256, I256, Timepoint, Duration, Val, Error, Void,
-    ///     MuxedAddress and user-defined types. A Vec<T> with one of these
+    ///     MuxedAddress and user-defined types. A `Vec<T>` with one of these
     ///     elements is rejected as a ramp, though it still defaults to empty.
     ///   - --auth-mode sets how authorization is mocked: all (default)
     ///     approves every entry, root-only approves only root invocation
@@ -87,6 +87,10 @@ pub enum Commands {
     ///     checked_/saturating_/wrapping_ call
     ///   - a persistent()/temporary() storage read with no extend_ttl in the
     ///     same function
+    ///
+    /// Each function is checked against its own body; functions nested in it
+    /// are checked separately, so each finding is reported once. Use --rule
+    /// to run only some rules, or --exclude-rule to skip some.
     ///
     /// These are syntactic heuristics: findings can be false positives, and
     /// no findings does not mean a contract is secure. Files that fail to
