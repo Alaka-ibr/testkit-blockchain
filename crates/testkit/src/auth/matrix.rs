@@ -3,6 +3,27 @@ use soroban_sdk::Address;
 use crate::core::{TestEnv, TestkitError};
 
 type InvokeFn<'a> = Box<dyn Fn(&Address) -> Result<(), soroban_sdk::Error> + 'a>;
+use std::collections::HashSet;
+use std::fmt;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatrixError {
+    /// Two or more entries share the same name.
+    DuplicateName(String),
+    // ...keep any existing variants...
+}
+
+impl fmt::Display for MatrixError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MatrixError::DuplicateName(name) => {
+                write!(f, "duplicate auth matrix name: {name:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MatrixError {}
 
 struct EntryPointSpec<'a> {
     name: String,
