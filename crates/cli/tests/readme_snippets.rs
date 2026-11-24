@@ -387,9 +387,10 @@ fn readme_failure_examples_match_the_shared_error_conventions() {
 
     // `soroban-testkit audit ./src --strict` with findings exits non-zero
     // with the README's `N audit finding(s) (--strict)` suffix. Run it
-    // against this workspace's own `crates/cli/src`, which has findings
-    // under the three-rule linter, rather than a fixture.
-    let output = run(&["audit", "crates/cli/src", "--strict"]);
+    // against the `examples/vault` contract source, which has findings under
+    // the three-rule linter. (The CLI's own source used to, but only through
+    // helper functions, which are not contract entry points since #134.)
+    let output = run(&["audit", "examples/vault/src", "--strict"]);
     let err = stderr(&output);
     assert_eq!(output.status.code(), Some(1), "stderr: {err}");
     assert!(

@@ -81,8 +81,9 @@ pub enum Commands {
     /// Static checks over a contract crate (not a security product)
     ///
     /// Parses every .rs file under PATH and reports three patterns:
-    ///   - a function taking an Address parameter that never calls
-    ///     require_auth
+    ///   - a contract entry point (a `pub fn` of a `#[contractimpl]` impl, or
+    ///     any fn of a `#[contractimpl]` trait impl) taking an Address
+    ///     parameter that never calls require_auth
     ///   - arithmetic (+ - * /) on an i128-typed binding outside a
     ///     checked_/saturating_/wrapping_ call
     ///   - a persistent()/temporary() storage read with no extend_ttl in the
@@ -90,11 +91,15 @@ pub enum Commands {
     ///
     /// Each function is checked against its own body; functions nested in it
     /// are checked separately, so each finding is reported once. Use --rule
-    /// to run only some rules, or --exclude-rule to skip some.
+    /// to run only some rules, or --exclude-rule to skip some, and
+    /// --include/--exclude to choose which files are audited.
     ///
     /// These are syntactic heuristics: findings can be false positives, and
     /// no findings does not mean a contract is secure. Files that fail to
-    /// parse are skipped. Findings exit 0 unless --strict is passed.
+    /// parse are not audited; each is listed with its parse error (as a
+    /// warning on stderr, or in the JSON `skipped` field). Findings and
+    /// skipped files exit 0 unless --strict is passed, which fails on
+    /// findings only.
     #[command(verbatim_doc_comment)]
     Audit(audit::AuditArgs),
     /// Hidden: runs a single limits probe in its own process. See
