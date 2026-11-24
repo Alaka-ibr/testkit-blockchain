@@ -49,6 +49,32 @@ pub enum EntryTtlStatus {
     Active(u32),
 }
 
+impl StorageKind {
+    /// Every storage kind, in a stable order (`Temporary`, `Persistent`,
+    /// `Instance`), for parameterized expiry tests.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::ttl::StorageKind;
+    ///
+    /// for kind in StorageKind::ALL {
+    ///     println!("{kind:?}");
+    /// }
+    /// assert_eq!(StorageKind::ALL.len(), 3);
+    /// ```
+    pub const ALL: [StorageKind; 3] = [
+        StorageKind::Temporary,
+        StorageKind::Persistent,
+        StorageKind::Instance,
+    ];
+
+    /// An iterator over [`StorageKind::ALL`].
+    pub fn iter() -> impl Iterator<Item = StorageKind> {
+        Self::ALL.into_iter()
+    }
+}
+
 impl TestEnv {
     /// The current TTL of a storage entry, in ledgers.
     ///
@@ -365,6 +391,69 @@ impl TestEnv {
         }
     }
 
+    /// Assert that running `f` leaves the TTL of the entry at `contract`/
+    /// `kind`/`key` exactly as it was — i.e. that the call did not extend
+    /// it. Use it to pin down read-only paths that must not pay for rent.
+    ///
+    /// The ledger is not advanced, so any change in TTL comes from `f`.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`TestkitError::AssertionFailed`] showing the before
+    /// and after TTLs if `f` changed it.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    /// use soroban_testkit::ttl::StorageKind;
+    /// use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
+    ///
+    /// #[contract]
+    /// struct Store;
+    ///
+    /// #[contractimpl]
+    /// impl Store {
+    ///     pub fn set(env: Env, key: Symbol, value: i128) {
+    ///         env.storage().persistent().set(&key, &value);
+    ///     }
+    ///     pub fn read(env: Env, key: Symbol) -> Option<i128> {
+    ///         env.storage().persistent().get(&key)
+    ///     }
+    /// }
+    ///
+    /// # fn main() {
+    /// let env = TestEnv::new();
+    /// let id = env.env().register(Store, ());
+    /// let client = StoreClient::new(env.env(), &id);
+    /// client.set(&symbol_short!("k"), &1);
+    ///
+    /// env.assert_ttl_unchanged(&id, StorageKind::Persistent, symbol_short!("k"), || {
+    ///     client.read(&symbol_short!("k"));
+    /// });
+    /// # }
+    /// ```
+    pub fn assert_ttl_unchanged<K: IntoVal<Env, Val>>(
+        &self,
+        contract: &Address,
+        kind: StorageKind,
+        key: K,
+        f: impl FnOnce(),
+    ) {
+        let key_val = key.into_val(self.env());
+        let before = self.ttl_of_val(contract, kind, &key_val);
+        f();
+        let after = self.ttl_of_val(contract, kind, &key_val);
+        if after != before {
+            panic!(
+                "{}",
+                TestkitError::AssertionFailed(format!(
+                    "expected the call to leave the {kind:?} TTL unchanged at {before}, but it was {after} afterward"
+                ))
+            );
+        }
+    }
+
     /// Assert that `f` completes without panicking after every entry of
     /// `kind` has expired (via [`TestEnv::expire`]) — i.e. that the
     /// contract handles an expired/missing entry gracefully instead of
@@ -672,6 +761,56 @@ mod tests {
         client.set_record(&1);
 
         env.assert_bumps_ttl_by_at_least(&id, StorageKind::Persistent, DataKey::Record, 1, || {
+            client.touch_record_checked();
+        });
+    }
+
+    #[test]
+    fn storage_kind_all_lists_every_kind_once_in_a_stable_order() {
+        assert_eq!(
+            StorageKind::ALL,
+            [
+                StorageKind::Temporary,
+                StorageKind::Persistent,
+                StorageKind::Instance
+            ]
+        );
+        assert_eq!(
+            StorageKind::iter().collect::<Vec<_>>(),
+            StorageKind::ALL.to_vec()
+        );
+        assert_eq!(StorageKind::iter().count(), 3);
+    }
+
+    #[test]
+    fn storage_kind_iter_drives_a_parameterized_expiry_test() {
+        for kind in StorageKind::iter() {
+            let env = TestEnv::new();
+            env.assert_survives_expiry(kind, || {});
+        }
+    }
+
+    #[test]
+    fn assert_ttl_unchanged_passes_on_a_call_that_does_not_bump() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        env.assert_ttl_unchanged(&id, StorageKind::Persistent, DataKey::Record, || {
+            client.touch_record();
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "expected the call to leave the Persistent TTL unchanged")]
+    fn assert_ttl_unchanged_fails_on_a_call_that_bumps() {
+        let env = TestEnv::new();
+        let id = env.env().register(Vault, ());
+        let client = VaultClient::new(env.env(), &id);
+        client.set_record(&1);
+
+        env.assert_ttl_unchanged(&id, StorageKind::Persistent, DataKey::Record, || {
             client.touch_record_checked();
         });
     }
