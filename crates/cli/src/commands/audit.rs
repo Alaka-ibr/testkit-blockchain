@@ -3,9 +3,11 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, ValueEnum};
+use proc_macro2::Span;
+use quote::ToTokens;
 use syn::visit::{self, Visit};
 use syn::{BinOp, Expr, FnArg, ImplItemFn, Item, ItemFn, Local, Pat, Signature, Type};
-use walkdir::WalkDir;
+use walkdir::{self, WalkDir};
 
 use super::output::Output;
 use super::CliError;
@@ -139,6 +141,7 @@ const AUDIT_JSON_SCHEMA_VERSION: u32 = 1;
 const DISCLAIMER: &str = "soroban-testkit audit is a linter with three heuristics, not a security \
                           product — a missing finding is not a security guarantee.";
 
+#[derive(Debug)]
 struct Finding {
     /// See [`finding_path`].
     file: String,
@@ -156,7 +159,9 @@ struct Finding {
 /// 1. Entry points taking an `Address` parameter that never call
 ///    `require_auth` anywhere in the function body.
 /// 2. Arithmetic (`+ - * /`) on an explicitly `i128`-typed binding, done
-///    outside a `checked_`/`saturating_`/`wrapping_` call.
+///    outside a `checked_`/`saturating_`/`wrapping_` call. The finding points
+///    at the operator's line, so multiline expressions identify the exact
+///    arithmetic source location.
 /// 3. A `.persistent()`/`.temporary()` storage read with no
 ///    `.extend_ttl(` call anywhere in the same function.
 ///
@@ -186,7 +191,10 @@ pub fn run(args: AuditArgs, out: Output) -> Result<(), CliError> {
                 super::quote(args.path.display())
             ))
         })?;
-        for entry in WalkDir::new(&args.path).into_iter().filter_map(Result::ok) {
+        for entry in WalkDir::new(&args.path) {
+            // A traversal error means at least one .rs file may never be
+            // examined, so stop instead of reporting a misleading clean audit.
+            let entry = entry.map_err(|err| traversal_error(&args.path, &err))?;
             // Skip symlinks: audit only follows the real filesystem structure for
             // deterministic results (symlinks can create cycles, loops, or
             // inaccessible paths depending on the platform and permissions).
@@ -324,6 +332,25 @@ fn audit_file(
     })?;
     audit_source(&src, display, rules, findings);
     Ok(())
+}
+
+/// Turns a `WalkDir` failure into the shared CLI error shape. The audited
+/// root is named so the message stays actionable when `walkdir::Error` has
+/// no path of its own (for example, some loop and metadata failures).
+fn traversal_error(root: &Path, err: &walkdir::Error) -> CliError {
+    let path = err.path().unwrap_or(root);
+    let cause = match err.io_error() {
+        Some(io) => io.to_string(),
+        None => err.to_string(),
+    };
+    format_traversal_error(path, &cause)
+}
+
+fn format_traversal_error(path: &Path, cause: &str) -> CliError {
+    CliError(format!(
+        "cannot audit {}: {cause}; make the directory readable or pass a different PATH",
+        super::quote(path.display())
+    ))
 }
 
 /// Parses `src` (the contents of a single `.rs` file, attributed to
@@ -486,12 +513,17 @@ fn type_is_address(ty: &Type) -> bool {
     }
 }
 
-fn line_of(node: impl quote::ToTokens) -> usize {
+fn line_of(node: impl ToTokens) -> usize {
+    first_span(node).start().line
+}
+
+/// The span of the first token produced by `node`. For a `BinOp` this is
+/// the operator itself, which is what arithmetic findings point at.
+fn first_span(node: impl ToTokens) -> Span {
     node.to_token_stream()
         .into_iter()
         .next()
-        .map(|t| t.span().start().line)
-        .unwrap_or(0)
+        .map_or_else(Span::call_site, |token| token.span())
 }
 
 /// Rule 2 uses a dedicated AST walk (rather than a text search) because
@@ -533,7 +565,7 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
         if self.arithmetic_touches_i128(&whole) {
             self.findings.push(Finding {
                 file: self.path.clone(),
-                line: line_of(node),
+                line: line_of(node.op),
                 rule: Rule::UncheckedI128Arithmetic.id(),
                 severity: "warning",
                 message: format!(
@@ -758,6 +790,40 @@ mod tests {
             // Line numbers from syn are 1-indexed starting at the 'fn' keyword
             assert!(finding.line > 0, "finding line should be positive");
         }
+    }
+
+    #[test]
+    fn arithmetic_findings_point_at_operator_lines_in_multiline_functions() {
+        let src = r#"
+fn pay(
+    amount: i128,
+) {
+    let first = amount
+        + 1;
+    let second = amount
+        * 2;
+}
+"#;
+        let mut findings = Vec::new();
+        audit_source(src, "test.rs", &Rule::ALL, &mut findings);
+
+        let lines: Vec<_> = findings
+            .iter()
+            .filter(|finding| finding.rule == "unchecked-i128-arithmetic")
+            .map(|finding| finding.line)
+            .collect();
+        assert_eq!(lines, vec![6, 8], "{findings:?}");
+    }
+
+    #[test]
+    fn traversal_errors_name_the_unreadable_path_and_the_io_cause() {
+        let message = format_traversal_error(Path::new("src"), "permission denied").0;
+
+        assert!(
+            message.starts_with("cannot audit `src`: permission denied"),
+            "{message}"
+        );
+        assert!(message.contains("make the directory readable"), "{message}");
     }
 
     #[test]

@@ -135,6 +135,26 @@ fn audit_reads_source_from_stdin_when_path_is_dash() {
 }
 
 #[test]
+fn audit_arithmetic_findings_report_the_operator_line() {
+    let src = r#"
+fn pay(
+    amount: i128,
+) {
+    let first = amount
+        + 1;
+}
+"#;
+    let output = run_cli_with_stdin(&["audit", "-"], src);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "stdout: {stdout}");
+    assert!(
+        stdout.contains("<stdin>:6: [warning] unchecked-i128-arithmetic"),
+        "the operator is on line 6: {stdout}"
+    );
+}
+
+#[test]
 fn audit_stdin_reports_no_findings_on_empty_input() {
     let output = run_cli_with_stdin(&["audit", "-"], "");
     let stdout = String::from_utf8_lossy(&output.stdout);
