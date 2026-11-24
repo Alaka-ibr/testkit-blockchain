@@ -21,6 +21,22 @@ pub struct TestToken {
     admin: Address,
     total_tracked: Cell<i128>,
 }
+impl<'a> SacFixture<'a> {
+    // ...existing constructors and methods stay as they are...
+
+    /// The admin address this fixture registered the token with.
+    ///
+    /// Use this when composing auth expectations, e.g. for `mint`,
+    /// `set_authorized`, or `set_admin`, which require the admin's auth.
+    pub fn admin(&self) -> &Address {
+        &self.admin
+    }
+
+    /// The admin address as an owned value, for APIs that take `Address` by value.
+    pub fn admin_address(&self) -> Address {
+        self.admin.clone()
+    }
+}
 
 impl TestToken {
     fn new(env: &Env, admin: Address) -> Self {
