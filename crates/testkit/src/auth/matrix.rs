@@ -90,19 +90,28 @@ impl<'a> AuthMatrix<'a> {
     ///     .assert_enforced();
     /// ```
     pub fn assert_enforced(self) {
+        // Entry points are visited by name and callers by address, not in
+        // registration order, so the grid and the failure message are the
+        // same however (and however many times) the matrix was built. The
+        // sort is stable, so entry points that share a name keep their
+        // registration order relative to each other.
+        let mut entry_points: Vec<&EntryPointSpec<'a>> = self.entry_points.iter().collect();
+        entry_points.sort_by(|a, b| a.name.cmp(&b.name));
+
         let mut known: Vec<Address> = Vec::new();
-        for ep in &self.entry_points {
+        for ep in &entry_points {
             for addr in &ep.allowed {
                 if !known.contains(addr) {
                     known.push(addr.clone());
                 }
             }
         }
+        known.sort_by_cached_key(|addr| format!("{addr:?}"));
 
         let mut violations = Vec::new();
         let mut grid = String::new();
 
-        for ep in &self.entry_points {
+        for ep in &entry_points {
             grid.push_str(&format!("  [{}]\n", ep.name));
             for addr in &known {
                 let expected = ep.allowed.contains(addr);
@@ -134,7 +143,7 @@ impl<'a> AuthMatrix<'a> {
                 TestkitError::AssertionFailed(format!(
                     "auth matrix violated ({} of {} cells):\n{}\nfull grid:\n{grid}",
                     violations.len(),
-                    self.entry_points.len() * known.len(),
+                    entry_points.len() * known.len(),
                     violations.join("\n"),
                 ))
             );
@@ -323,5 +332,48 @@ mod tests {
     fn assert_requires_auth_panics_when_call_succeeds() {
         let env = TestEnv::new();
         env.assert_requires_auth(|| {});
+    }
+
+    #[test]
+    fn failure_grid_is_independent_of_registration_order_and_duplicate_allowed_addresses() {
+        let env = TestEnv::new();
+        let a = env.address();
+        let b = env.address();
+
+        // Both entry points wrongly accept everyone, so every cell where the
+        // caller is not allowed is a violation.
+        let build = |reverse: bool, repeat_allowed: bool| {
+            let allowed_a: Vec<Address> = if repeat_allowed {
+                vec![a.clone(), a.clone()]
+            } else {
+                vec![a.clone()]
+            };
+            let allowed_b = vec![b.clone()];
+            let matrix = AuthMatrix::new(&env);
+            if reverse {
+                matrix
+                    .entry_point("beta", &allowed_b, |_c: &Address| Ok(()))
+                    .entry_point("alpha", &allowed_a, |_c: &Address| Ok(()))
+            } else {
+                matrix
+                    .entry_point("alpha", &allowed_a, |_c: &Address| Ok(()))
+                    .entry_point("beta", &allowed_b, |_c: &Address| Ok(()))
+            }
+        };
+
+        let message = |reverse, repeat| {
+            crate::testing::assert_panics_with_code("TESTKIT_ASSERTION_FAILED", || {
+                build(reverse, repeat).assert_enforced();
+            })
+        };
+
+        let baseline = message(false, false);
+        assert_eq!(baseline, message(true, false), "registration order changed the grid");
+        assert_eq!(baseline, message(false, true), "a repeated allowed address changed the grid");
+        assert_eq!(baseline, message(true, true));
+        assert!(
+            baseline.find("[alpha]").unwrap() < baseline.find("[beta]").unwrap(),
+            "entry points should appear in name order: {baseline}"
+        );
     }
 }
