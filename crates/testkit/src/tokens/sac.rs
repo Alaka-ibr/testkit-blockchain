@@ -176,6 +176,48 @@ impl TestToken {
         TokenClient::new(&self.env, &self.address).balance(of)
     }
 
+    use soroban_sdk::{token::TokenClient, Address, Env, String};
+
+/// Snapshot of what the token contract reports on-chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenMetadata {
+    pub name: String,
+    pub symbol: String,
+    pub decimals: u32,
+}
+
+impl SacDouble {
+    // NOTE: assumes the double holds `env: Env` and `address: Address`.
+    // Adapt field names to the real struct.
+
+    /// Read metadata from the contract as the SDK exposes it.
+    pub fn metadata(&self) -> TokenMetadata {
+        let client = TokenClient::new(&self.env, &self.address);
+        TokenMetadata {
+            name: client.name(),
+            symbol: client.symbol(),
+            decimals: client.decimals(),
+        }
+    }
+
+    /// Assert the full metadata snapshot.
+    pub fn assert_metadata(&self, expected: &TokenMetadata) {
+        assert_eq!(&self.metadata(), expected, "token metadata mismatch");
+    }
+
+    /// SAC decimals are fixed by the protocol.
+    pub fn assert_default_sac_decimals(&self) {
+        assert_eq!(self.metadata().decimals, 7);
+    }
+
+    /// Metadata must not change across an admin rotation.
+    pub fn assert_metadata_unchanged_by<F: FnOnce(&Self)>(&self, action: F) {
+        let before = self.metadata();
+        action(self);
+        assert_eq!(before, self.metadata(), "metadata changed unexpectedly");
+    }
+}
+
     /// Assert that `of`'s base-unit balance equals `expected`.
     ///
     /// # Panics
