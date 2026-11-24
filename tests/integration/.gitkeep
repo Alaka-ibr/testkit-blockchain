@@ -1,0 +1,31 @@
+#[test]
+fn fixture_exposes_the_admin_it_was_created_with() {
+    let env = Env::default();
+    let fixture = SacFixture::new(&env); // use your real constructor
+
+    // The exposed admin must match the SAC's on-chain admin.
+    let on_chain_admin = StellarAssetClient::new(&env, &fixture.address()).admin();
+    assert_eq!(fixture.admin(), &on_chain_admin);
+}
+
+#[test]
+fn admin_can_be_used_to_compose_auth_expectations() {
+    let env = Env::default();
+    let fixture = SacFixture::new(&env);
+    let recipient = Address::generate(&env);
+
+    env.mock_all_auths();
+    fixture.client().mint(&recipient, &100);
+
+    // The recorded auth for `mint` must be the fixture admin's.
+    let auths = env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(&auths[0].0, fixture.admin());
+}
+
+#[test]
+fn admin_address_returns_an_equal_owned_copy() {
+    let env = Env::default();
+    let fixture = SacFixture::new(&env);
+    assert_eq!(fixture.admin_address(), *fixture.admin());
+}
