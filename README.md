@@ -586,6 +586,13 @@ contract security review, so both false positives and false negatives are
 expected. Unreadable directories abort the audit with an error instead of
 being silently skipped, since skipping one could hide every finding in it.
 Files that cannot be parsed are reported as skipped, as described above.
+
+Symbolic links are not followed below `PATH`. A linked file or directory inside
+the tree is listed as `symlink, not followed` under `--verbose` and is not read, so a link cannot audit the same source under two paths or loop. A `PATH`
+that is itself a symlink is followed, so `soroban-testkit audit linked-crate`
+audits the crate it points at instead of reporting a clean result for zero
+files.
+
 Every run that isn't `--quiet`, including one with no findings, ends with the
 same disclaimer: a missing finding is not a security guarantee.
 
