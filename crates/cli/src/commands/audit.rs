@@ -30,8 +30,8 @@ pub struct AuditArgs {
     /// (for editor integrations that audit unsaved buffers)
     #[arg(value_name = "PATH", default_value = ".", verbatim_doc_comment)]
     path: PathBuf,
-    /// Exit 1 if any findings are reported. Without it, findings are
-    /// printed and the command still exits 0
+    /// Exit 1 if any findings are reported, or 2 if a file failed to parse.
+    /// Without it, findings are printed and the command still exits 0
     #[arg(long, verbatim_doc_comment)]
     strict: bool,
     /// Print findings as a JSON document (`schema_version` 1) on stdout
@@ -293,6 +293,22 @@ struct Skipped {
     message: String,
 }
 
+/// Exit status for `audit` when its input could not be audited: a PATH that is
+/// missing or unreadable, or, with `--strict`, a file that fails to parse. See
+/// `EXIT STATUS` in `--help`.
+pub const INVALID_INPUT_EXIT_CODE: i32 = 2;
+
+/// How an `audit` run that read its input ended. Invalid input is an error,
+/// not a status (see [`run`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum AuditStatus {
+    /// The scan completed. Findings, if any, do not fail the run unless
+    /// `--strict` is passed.
+    Pass,
+    /// `--strict` was passed and this many findings were reported.
+    StrictFindings(usize),
+}
+
 #[derive(Debug)]
 struct Finding {
     /// See [`finding_path`].
@@ -393,6 +409,17 @@ pub fn run(args: AuditArgs, out: Output) -> Result<(), CliError> {
             );
         }
     }
+    // A file that does not parse is not audited. Without --strict it is
+    // reported above and the run goes on. With --strict the run is invalid
+    // input, because a clean result would hide a file nobody checked.
+    if args.strict && !skipped.is_empty() {
+        let files: Vec<&str> = skipped.iter().map(|skip| skip.file.as_str()).collect();
+        return Err(CliError(format!(
+            "{} file(s) failed to parse and were not audited (--strict): {}",
+            skipped.len(),
+            files.join(", ")
+        )));
+    }
     let skipped_note = match skipped.len() {
         0 => String::new(),
         1 => " 1 file could not be parsed and was not audited (see the warning above).".to_string(),
@@ -426,12 +453,9 @@ pub fn run(args: AuditArgs, out: Output) -> Result<(), CliError> {
     }
 
     if args.strict && !findings.is_empty() {
-        return Err(CliError(format!(
-            "{} audit finding(s) (--strict)",
-            findings.len()
-        )));
+        return Ok(AuditStatus::StrictFindings(findings.len()));
     }
-    Ok(())
+    Ok(AuditStatus::Pass)
 }
 
 /// What a directory walk decided: the `.rs` files to audit, and the paths it

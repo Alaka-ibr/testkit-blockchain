@@ -392,7 +392,10 @@ error: 2 audit finding(s) (--strict)
 
 Every command reports failures the same way: exit status 1 and a single
 `error: <message>` on stderr (clap's own usage errors also start with
-`error:`, but exit 2). Messages say what failed and, where there is one,
+`error:`, but exit 2). The one exception is `audit` invalid input (a PATH that
+is missing or unreadable, or with `--strict` a file that fails to parse),
+which exits 2 so it can be told apart from `--strict` findings (exit 1).
+Messages say what failed and, where there is one,
 the fix; user-supplied names, paths and types are wrapped in backticks,
 and contract types are shown as Rust-like names (`Vec<Address>`), never
 as Rust debug output or a panic backtrace. The conventions live on
@@ -429,6 +432,12 @@ The text report also says explicitly when the search was capped.
 fresh environment, and reports the median with the min and max for each field.
 The JSON `measurements` object carries the same spread. Use it when a contract
 or the host may vary between runs; a single measurement is one sample.
+
+`--start N` (default 0) and `--step N` (default 1) choose the ramp values:
+probes are `start + k*step` for k = 0, 1, 2, 4, and so on. A negative
+`--step` probes downwards, into negative values for signed parameters. Every
+probe must fit the ramp type, so a `u32` ramp cannot go below 0; a `--start`
+or `--step` outside the type's range is refused before any probe runs.
 
 Example:
 
@@ -595,6 +604,12 @@ files.
 
 Every run that isn't `--quiet`, including one with no findings, ends with the
 same disclaimer: a missing finding is not a security guarantee.
+
+Exit status: `0` when the scan completes (findings are printed but do not fail
+the run unless `--strict` is passed); `1` when `--strict` is passed and findings
+are reported; `2` for invalid input. A file that fails to parse is skipped with
+a warning on stderr, and `--strict` turns it into invalid input, since a clean
+result would otherwise hide a file nobody checked.
 
 ## Roadmap
 
