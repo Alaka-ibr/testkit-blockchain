@@ -6,12 +6,22 @@ use soroban_sdk::{Address, Env, IntoVal};
 
 use crate::core::{TestEnv, TestkitError};
 
-/// The decimal precision every Stellar Asset Contract uses. This is fixed
-/// by the protocol (the classic Stellar asset precision), not something a
-/// deployer can choose — verified against soroban-sdk 27.0.6:
+/// The decimal precision every Stellar Asset Contract uses.
+///
+/// This is fixed by the protocol (the classic Stellar asset precision), not
+/// something a deployer can choose. Verified against soroban-sdk 27.0.6:
 /// `register_stellar_asset_contract_v2` takes no decimals parameter, and a
 /// freshly deployed SAC's own `decimals()` always returns 7.
-const SAC_DECIMALS: u32 = 7;
+///
+/// # Example
+///
+/// ```
+/// use soroban_testkit::prelude::*;
+///
+/// let env = TestEnv::new();
+/// assert_eq!(env.token().decimals(), SAC_DECIMALS);
+/// ```
+pub const SAC_DECIMALS: u32 = 7;
 
 /// A deployed Stellar Asset Contract test double, with one-line mint/balance
 /// helpers so tests don't hand-roll SAC setup boilerplate.
@@ -20,22 +30,6 @@ pub struct TestToken {
     address: Address,
     admin: Address,
     total_tracked: Cell<i128>,
-}
-impl<'a> SacFixture<'a> {
-    // ...existing constructors and methods stay as they are...
-
-    /// The admin address this fixture registered the token with.
-    ///
-    /// Use this when composing auth expectations, e.g. for `mint`,
-    /// `set_authorized`, or `set_admin`, which require the admin's auth.
-    pub fn admin(&self) -> &Address {
-        &self.admin
-    }
-
-    /// The admin address as an owned value, for APIs that take `Address` by value.
-    pub fn admin_address(&self) -> Address {
-        self.admin.clone()
-    }
 }
 
 impl TestToken {
@@ -47,6 +41,19 @@ impl TestToken {
             admin,
             total_tracked: Cell::new(0),
         }
+    }
+
+    /// The admin address this token was registered with.
+    ///
+    /// Use this when composing auth expectations, e.g. for `mint`,
+    /// `set_authorized`, or `set_admin`, which require the admin's auth.
+    pub fn admin(&self) -> &Address {
+        &self.admin
+    }
+
+    /// The admin address as an owned value, for APIs that take `Address` by value.
+    pub fn admin_address(&self) -> Address {
+        self.admin.clone()
     }
 
     /// The token contract's address.
@@ -147,16 +154,20 @@ impl TestToken {
         // Work out the new tracked total first, so an overflow is reported
         // before anything is minted and the token and the tracker never
         // disagree.
-        let new_total = self.total_tracked.get().checked_add(amount).unwrap_or_else(|| {
-            panic!(
-                "{}",
-                TestkitError::Misuse(format!(
+        let new_total = self
+            .total_tracked
+            .get()
+            .checked_add(amount)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}",
+                    TestkitError::Misuse(format!(
                     "mint_raw({amount}) would overflow total_tracked (currently {}); the sum of \
                      all mints must stay within i128::MAX",
                     self.total_tracked.get()
                 ))
-            )
-        });
+                )
+            });
         StellarAssetClient::new(&self.env, &self.address)
             .mock_auths(&[MockAuth {
                 address: &self.admin,
@@ -175,48 +186,6 @@ impl TestToken {
     pub fn balance(&self, of: &Address) -> i128 {
         TokenClient::new(&self.env, &self.address).balance(of)
     }
-
-    use soroban_sdk::{token::TokenClient, Address, Env, String};
-
-/// Snapshot of what the token contract reports on-chain.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TokenMetadata {
-    pub name: String,
-    pub symbol: String,
-    pub decimals: u32,
-}
-
-impl SacDouble {
-    // NOTE: assumes the double holds `env: Env` and `address: Address`.
-    // Adapt field names to the real struct.
-
-    /// Read metadata from the contract as the SDK exposes it.
-    pub fn metadata(&self) -> TokenMetadata {
-        let client = TokenClient::new(&self.env, &self.address);
-        TokenMetadata {
-            name: client.name(),
-            symbol: client.symbol(),
-            decimals: client.decimals(),
-        }
-    }
-
-    /// Assert the full metadata snapshot.
-    pub fn assert_metadata(&self, expected: &TokenMetadata) {
-        assert_eq!(&self.metadata(), expected, "token metadata mismatch");
-    }
-
-    /// SAC decimals are fixed by the protocol.
-    pub fn assert_default_sac_decimals(&self) {
-        assert_eq!(self.metadata().decimals, 7);
-    }
-
-    /// Metadata must not change across an admin rotation.
-    pub fn assert_metadata_unchanged_by<F: FnOnce(&Self)>(&self, action: F) {
-        let before = self.metadata();
-        action(self);
-        assert_eq!(before, self.metadata(), "metadata changed unexpectedly");
-    }
-}
 
     /// Assert that `of`'s base-unit balance equals `expected`.
     ///
